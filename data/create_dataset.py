@@ -87,10 +87,14 @@ def main():
     trainPath        = os.path.join(args.dataset_folder, "train")
     testPath         = os.path.join(args.dataset_folder, "test")
     validationPath   = os.path.join(args.dataset_folder, "validation")
-    os.mkdir(extractPath)
-    os.mkdir(trainPath)
-    os.mkdir(testPath)
-    os.mkdir(validationPath)
+    if not os.path.exists(extractPath):
+        os.mkdir(extractPath)
+    if not os.path.exists(trainPath):
+        os.mkdir(trainPath)
+    if not os.path.exists(testPath):
+        os.mkdir(testPath)
+    if not os.path.exists(validationPath):
+        os.mkdir(validationPath)
 
     if(args.dataset == "adobe240fps"):
         f = open("adobe240fps/test_list.txt", "r")

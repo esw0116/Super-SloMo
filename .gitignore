@@ -109,3 +109,7 @@ output.mp4
 
 # ignore folder
 tmpSuperSloMo/
+log/
+pretrained_models/
+checkpoint/
+dataset

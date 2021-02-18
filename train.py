@@ -9,11 +9,11 @@ import torchvision.transforms as transforms
 import torch.optim as optim
 import torch.nn as nn
 import torch.nn.functional as F
-import model
-import dataloader
+from model import superslomo
+import dataloader, gopro
 from math import log10
 import datetime
-from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 
 
 # For parsing commandline arguments
@@ -23,17 +23,15 @@ parser.add_argument("--checkpoint_dir", type=str, required=True, help='path to f
 parser.add_argument("--checkpoint", type=str, help='path of checkpoint for pretrained model')
 parser.add_argument("--train_continue", type=bool, default=False, help='If resuming from checkpoint, set to True and set `checkpoint` path. Default: False.')
 parser.add_argument("--epochs", type=int, default=200, help='number of epochs to train. Default: 200.')
-parser.add_argument("--train_batch_size", type=int, default=6, help='batch size for training. Default: 6.')
-parser.add_argument("--validation_batch_size", type=int, default=10, help='batch size for validation. Default: 10.')
+parser.add_argument("--train_batch_size", type=int, default=8, help='batch size for training. Default: 6.')
+parser.add_argument("--validation_batch_size", type=int, default=1, help='batch size for validation. Default: 10.')
 parser.add_argument("--init_learning_rate", type=float, default=0.0001, help='set initial learning rate. Default: 0.0001.')
 parser.add_argument("--milestones", type=list, default=[100, 150], help='Set to epoch values where you want to decrease learning rate by a factor of 0.1. Default: [100, 150]')
 parser.add_argument("--progress_iter", type=int, default=100, help='frequency of reporting progress and validation. N: after every N iterations. Default: 100.')
 parser.add_argument("--checkpoint_epoch", type=int, default=5, help='checkpoint saving frequency. N: after every N epochs. Each checkpoint is roughly of size 151 MB.Default: 5.')
 args = parser.parse_args()
 
-##[TensorboardX](https://github.com/lanpa/tensorboardX)
 ### For visualizing loss and interpolated frames
-
 
 writer = SummaryWriter('log')
 
@@ -42,18 +40,18 @@ writer = SummaryWriter('log')
 
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-flowComp = model.UNet(6, 4)
+flowComp = superslomo.UNet(6, 4)
 flowComp.to(device)
-ArbTimeFlowIntrp = model.UNet(20, 5)
+ArbTimeFlowIntrp = superslomo.UNet(20, 5)
 ArbTimeFlowIntrp.to(device)
 
 
 ###Initialze backward warpers for train and validation datasets
 
 
-trainFlowBackWarp      = model.backWarp(352, 352, device)
+trainFlowBackWarp      = superslomo.backWarp(352, 352, device)
 trainFlowBackWarp      = trainFlowBackWarp.to(device)
-validationFlowBackWarp = model.backWarp(640, 352, device)
+validationFlowBackWarp = superslomo.backWarp(1280, 704, device)
 validationFlowBackWarp = validationFlowBackWarp.to(device)
 
 
@@ -67,10 +65,17 @@ normalize = transforms.Normalize(mean=mean,
                                  std=std)
 transform = transforms.Compose([transforms.ToTensor(), normalize])
 
-trainset = dataloader.SuperSloMo(root=args.dataset_root + '/train', transform=transform, train=True)
+# trainset = dataloader.SuperSloMo(root=args.dataset_root + '/train', transform=transform, train=True)
+# trainloader = torch.utils.data.DataLoader(trainset, batch_size=args.train_batch_size, shuffle=True)
+
+# validationset = dataloader.SuperSloMo(root=args.dataset_root + '/validation', transform=transform, randomCropSize=(640, 352), train=False)
+# validationloader = torch.utils.data.DataLoader(validationset, batch_size=args.validation_batch_size, shuffle=False)
+
+# GoPro
+trainset = gopro.GoPro(root=args.dataset_root, transform=transform, train=True)
 trainloader = torch.utils.data.DataLoader(trainset, batch_size=args.train_batch_size, shuffle=True)
 
-validationset = dataloader.SuperSloMo(root=args.dataset_root + '/validation', transform=transform, randomCropSize=(640, 352), train=False)
+validationset = gopro.GoPro(root=args.dataset_root, transform=transform, randomCropSize=(1280, 704), train=False)
 validationloader = torch.utils.data.DataLoader(validationset, batch_size=args.validation_batch_size, shuffle=False)
 
 print(trainset, validationset)
@@ -136,7 +141,7 @@ def validate():
             F_0_1 = flowOut[:,:2,:,:]
             F_1_0 = flowOut[:,2:,:,:]
 
-            fCoeff = model.getFlowCoeff(validationFrameIndex, device)
+            fCoeff = superslomo.getFlowCoeff(validationFrameIndex, device)
 
             F_t_0 = fCoeff[0] * F_0_1 + fCoeff[1] * F_1_0
             F_t_1 = fCoeff[2] * F_0_1 + fCoeff[3] * F_1_0
@@ -148,13 +153,13 @@ def validate():
                 
             F_t_0_f = intrpOut[:, :2, :, :] + F_t_0
             F_t_1_f = intrpOut[:, 2:4, :, :] + F_t_1
-            V_t_0   = F.sigmoid(intrpOut[:, 4:5, :, :])
+            V_t_0   = torch.sigmoid(intrpOut[:, 4:5, :, :])
             V_t_1   = 1 - V_t_0
                 
             g_I0_F_t_0_f = validationFlowBackWarp(I0, F_t_0_f)
             g_I1_F_t_1_f = validationFlowBackWarp(I1, F_t_1_f)
             
-            wCoeff = model.getWarpCoeff(validationFrameIndex, device)
+            wCoeff = superslomo.getWarpCoeff(validationFrameIndex, device)
             
             Ft_p = (wCoeff[0] * V_t_0 * g_I0_F_t_0_f + wCoeff[1] * V_t_1 * g_I1_F_t_1_f) / (wCoeff[0] * V_t_0 + wCoeff[1] * V_t_1)
             
@@ -218,8 +223,6 @@ for epoch in range(dict1['epoch'] + 1, args.epochs):
     valPSNR.append([])
     iLoss = 0
     
-    # Increment scheduler count    
-    scheduler.step()
     
     for trainIndex, (trainData, trainFrameIndex) in enumerate(trainloader, 0):
         
@@ -239,7 +242,7 @@ for epoch in range(dict1['epoch'] + 1, args.epochs):
         F_0_1 = flowOut[:,:2,:,:]
         F_1_0 = flowOut[:,2:,:,:]
         
-        fCoeff = model.getFlowCoeff(trainFrameIndex, device)
+        fCoeff = superslomo.getFlowCoeff(trainFrameIndex, device)
         
         # Calculate intermediate flows
         F_t_0 = fCoeff[0] * F_0_1 + fCoeff[1] * F_1_0
@@ -255,14 +258,14 @@ for epoch in range(dict1['epoch'] + 1, args.epochs):
         # Extract optical flow residuals and visibility maps
         F_t_0_f = intrpOut[:, :2, :, :] + F_t_0
         F_t_1_f = intrpOut[:, 2:4, :, :] + F_t_1
-        V_t_0   = F.sigmoid(intrpOut[:, 4:5, :, :])
+        V_t_0   = torch.sigmoid(intrpOut[:, 4:5, :, :])
         V_t_1   = 1 - V_t_0
         
         # Get intermediate frames from the intermediate flows
         g_I0_F_t_0_f = trainFlowBackWarp(I0, F_t_0_f)
         g_I1_F_t_1_f = trainFlowBackWarp(I1, F_t_1_f)
         
-        wCoeff = model.getWarpCoeff(trainFrameIndex, device)
+        wCoeff = superslomo.getWarpCoeff(trainFrameIndex, device)
         
         # Calculate final intermediate frame 
         Ft_p = (wCoeff[0] * V_t_0 * g_I0_F_t_0_f + wCoeff[1] * V_t_1 * g_I1_F_t_1_f) / (wCoeff[0] * V_t_0 + wCoeff[1] * V_t_1)
@@ -311,10 +314,12 @@ for epoch in range(dict1['epoch'] + 1, args.epochs):
             
             print(" Loss: %0.6f  Iterations: %4d/%4d  TrainExecTime: %0.1f  ValLoss:%0.6f  ValPSNR: %0.4f  ValEvalTime: %0.2f LearningRate: %f" % (iLoss / args.progress_iter, trainIndex, len(trainloader), end - start, vLoss, psnr, endVal - end, get_lr(optimizer)))
             
-            
             cLoss[epoch].append(iLoss/args.progress_iter)
             iLoss = 0
             start = time.time()
+        
+    # Increment scheduler count    
+    scheduler.step()
     
     # Create checkpoint after every `args.checkpoint_epoch` epochs
     if ((epoch % args.checkpoint_epoch) == args.checkpoint_epoch - 1):
