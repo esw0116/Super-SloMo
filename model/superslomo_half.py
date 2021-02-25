@@ -317,7 +317,8 @@ def getFlowCoeff (indices, device, seq_len):
         tensor
             coefficients C00, C01, C10, C11.
     """
-    t = np.linspace(1/(seq_len-1), 1-1/(seq_len-1), seq_len-2)
+    half_seq_len = seq_len // 2 + 1
+    t = np.linspace(1/(half_seq_len-1), 1-1/(half_seq_len-1), half_seq_len-2)
     # Convert indices tensor to numpy array
     ind = indices.detach().numpy()
     C11 = C00 = - (1 - (t[ind])) * (t[ind])
@@ -353,7 +354,8 @@ def getWarpCoeff (indices, device, seq_len):
             coefficients C0 and C1.
     """
 
-    t = np.linspace(1/(seq_len-1), 1-1/(seq_len-1), seq_len-2)
+    half_seq_len = seq_len // 2 + 1
+    t = np.linspace(1/(half_seq_len-1), 1-1/(half_seq_len-1), half_seq_len-2)
     # Convert indices tensor to numpy array
     ind = indices.detach().numpy()
     C0 = 1 - t[ind]

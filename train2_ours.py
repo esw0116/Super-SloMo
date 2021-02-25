@@ -19,7 +19,10 @@ import dataloader
 from copy import deepcopy
 from math import log10
 import datetime
-import os
+import os, sys
+import numpy as np
+import pandas as pd
+import tqdm
 
 
 # For parsing commandline arguments
@@ -27,7 +30,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--dataset_root", type=str, required=True, help='path to dataset folder containing train-test-validation folders')
 parser.add_argument("--checkpoint_dir", type=str, required=True, help='path to folder for saving checkpoints')
 parser.add_argument("--checkpoint", type=str, help='path of checkpoint for pretrained model')
-parser.add_argument("--train_continue", type=bool, default=False, help='If resuming from checkpoint, set to True and set `checkpoint` path. Default: False.')
+parser.add_argument("--train_continue", action='store_true', help='If resuming from checkpoint, set to True and set `checkpoint` path. Default: False.')
 parser.add_argument("--epochs", type=int, default=200, help='number of epochs to train. Default: 200.')
 parser.add_argument("--seq_len", type=int, default=11, help='number of frames that composes a sequence.')
 parser.add_argument("--train_batch_size", type=int, default=8, help='batch size for training. Default: 6.')
@@ -156,7 +159,7 @@ def validate():
     tloss = 0
     flag = 1
     with torch.no_grad():
-        for validationIndex, (validationData, validationFrameIndex) in enumerate(validationloader, 0):
+        for validationIndex, (validationData, validationFrameIndex, _) in enumerate(validationloader, 0):
             # frame0, frameT, frame1 = validationData
 
             # I0 = frame0.to(device)
@@ -192,7 +195,7 @@ def validate():
             F_0_1 = flowOut[:,:2,:,:]
             F_1_0 = flowOut[:,2:,:,:]
 
-            fCoeff = superslomo.getFlowCoeff(validationFrameIndex, device)
+            fCoeff = superslomo.getFlowCoeff(validationFrameIndex, device, seq_len)
 
             F_t_0 = fCoeff[0] * F_0_1 + fCoeff[1] * F_1_0
             F_t_1 = fCoeff[2] * F_0_1 + fCoeff[3] * F_1_0
@@ -210,7 +213,7 @@ def validate():
             g_I0_F_t_0_f = validationFlowBackWarp(I0, F_t_0_f)
             g_I1_F_t_1_f = validationFlowBackWarp(I1, F_t_1_f)
             
-            wCoeff = superslomo.getWarpCoeff(validationFrameIndex, device)
+            wCoeff = superslomo.getWarpCoeff(validationFrameIndex, device, seq_len)
             
             Ft_p = (wCoeff[0] * V_t_0 * g_I0_F_t_0_f + wCoeff[1] * V_t_1 * g_I1_F_t_1_f) / (wCoeff[0] * V_t_0 + wCoeff[1] * V_t_1)
             
@@ -243,12 +246,121 @@ def validate():
     return (psnr / len(validationloader)), (tloss / len(validationloader)), retImg
 
 
+def test():
+    df_column = ['Name']
+    df_column.extend([str(i) for i in range(1, seq_len + 1)])
+
+    df = pd.DataFrame(columns=df_column)
+
+    psnr_array = np.zeros((0, seq_len))
+    ssim_array = np.zeros((0, seq_len))
+
+    tqdm_loader = tqdm.tqdm(validationloader, ncols=80)
+
+    imgsave_folder = os.path.join(args.checkpoint_dir, 'Saved_imgs')
+    if not os.path.exists(imgsave_folder):
+        os.mkdir(imgsave_folder)
+
+    with torch.no_grad():
+        for validationIndex, (validationData, validationFrameIndex, validationFile) in enumerate(tqdm_loader):
+            
+            blurred_img = torch.zeros_like(validationData[0])
+            for image in validationData:
+                blurred_img += image
+            blurred_img /= len(validationData)
+            blurred_img = blurred_img.to(device)
+            batch_size = blurred_img.shape[0]
+
+            c = center_estimation(blurred_img)
+            start, end = border_estimation(blurred_img, c)
+
+            compare_ftn = nn.L1Loss()
+            frame0 = validationData[0].to(device)
+            frame1 = validationData[-1].to(device)
+            parallel = True if compare_ftn(start, frame0) + compare_ftn(end, frame1) <= compare_ftn(start, frame1) + compare_ftn(end, frame0) else False
+
+            if parallel:
+                I0, I1 = start, end
+            else:
+                I0, I1 = end, start
+            '''
+            I0 = validationData[0].to(device)
+            I1 = validationData[-1].to(device)
+            batch_size = I0.shape[0]
+            '''
+            psnrs = np.zeros((batch_size, seq_len))
+            ssims = np.zeros((batch_size, seq_len))
+
+            for vindex in range(seq_len):                    
+                frameT = validationData[vindex]
+                IFrame = frameT.to(device)
+
+                if vindex == 0:
+                    Ft_p = I0.clone()
+
+                elif vindex == seq_len-1:
+                    Ft_p = I1.clone()
+
+                else:
+                    validationIndex = torch.ones(batch_size) * (vindex - 1)
+                    validationIndex = validationIndex.long()
+                    flowOut = flowComp(torch.cat((I0, I1), dim=1))
+                    F_0_1 = flowOut[:,:2,:,:]
+                    F_1_0 = flowOut[:,2:,:,:]
+
+                    fCoeff = superslomo.getFlowCoeff(validationIndex, device, seq_len)
+
+                    F_t_0 = fCoeff[0] * F_0_1 + fCoeff[1] * F_1_0
+                    F_t_1 = fCoeff[2] * F_0_1 + fCoeff[3] * F_1_0
+
+                    g_I0_F_t_0 = validationFlowBackWarp(I0, F_t_0)
+                    g_I1_F_t_1 = validationFlowBackWarp(I1, F_t_1)
+                    
+                    intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
+                    
+                    F_t_0_f = intrpOut[:, :2, :, :] + F_t_0
+                    F_t_1_f = intrpOut[:, 2:4, :, :] + F_t_1
+                    V_t_0   = torch.sigmoid(intrpOut[:, 4:5, :, :])
+                    V_t_1   = 1 - V_t_0
+                    
+                    g_I0_F_t_0_f = validationFlowBackWarp(I0, F_t_0_f)
+                    g_I1_F_t_1_f = validationFlowBackWarp(I1, F_t_1_f)
+                    
+                    wCoeff = superslomo.getWarpCoeff(validationIndex, device, seq_len)
+                    
+                    Ft_p = (wCoeff[0] * V_t_0 * g_I0_F_t_0_f + wCoeff[1] * V_t_1 * g_I1_F_t_1_f) / (wCoeff[0] * V_t_0 + wCoeff[1] * V_t_1)
+                
+                for b in range(batch_size):
+                    foldername = os.path.basename(os.path.dirname(validationFile[ctr_idx][b]))
+                    filename = os.path.splitext(os.path.basename(validationFile[vindex][b]))[0]
+                    
+                    out_fname = foldername + '_' + filename + '_out.png'
+                    gt_fname = foldername + '_' + filename + '.png'
+
+                    Ft_p[b] = revNormalize(Ft_p[b])
+                    IFrame[b] = revNormalize(IFrame[b])
+                    out, gt = quantize(Ft_p[b]), quantize(IFrame[b])
+
+                    torchvision.utils.save_image(out, os.path.join(imgsave_folder, out_fname), normalize=True, range=(0,255))
+                    torchvision.utils.save_image(gt, os.path.join(imgsave_folder, gt_fname), normalize=True, range=(0,255))
+
+                psnr, ssim = eval_metrics(Ft_p, IFrame)
+                psnrs[:, vindex] = psnr.cpu().numpy()
+                ssims[:, vindex] = ssim.cpu().numpy()
+
+            for b in range(batch_size):
+                rows = [validationFile[ctr_idx][b]]
+                rows.extend(list(psnrs[b]))
+                df = df.append(pd.Series(rows, index=df.columns), ignore_index=True)
+            
+        df.to_csv('{}/results_PSNR.csv'.format(args.checkpoint_dir))
+
+
 ### Initialization
 
-
-if args.train_continue:
+if args.train_continue or args.test_only:
     dict1 = torch.load(args.checkpoint)
-    ArbTimeFlowIntrp.load_state_dict(dict1['state_dictAT'])
+    ArbTimeFlowIntrp.load_state_dict(dict1['state_dictAT'], strict=False)
     flowComp.load_state_dict(dict1['state_dictFC'])
 else:
     dict1 = {'loss': [], 'valLoss': [], 'valPSNR': [], 'epoch': -1}
@@ -263,6 +375,12 @@ valLoss = dict1['valLoss']
 valPSNR = dict1['valPSNR']
 checkpoint_counter = 0
 
+if args.test_only:
+    print("Test Start")
+    test()
+    print("Test End")
+    sys.exit(0)
+
 ### Main training loop
 for epoch in range(dict1['epoch'] + 1, args.epochs):
     print("Epoch: ", epoch)
@@ -273,7 +391,7 @@ for epoch in range(dict1['epoch'] + 1, args.epochs):
     valPSNR.append([])
     iLoss = 0
     
-    for trainIndex, (trainData, trainFrameIndex) in enumerate(trainloader, 0):
+    for trainIndex, (trainData, trainFrameIndex, _) in enumerate(trainloader, 0):
         
 		## Getting the input and the target from the training set
         # frame0, frameT, frame1 = trainData
@@ -314,7 +432,7 @@ for epoch in range(dict1['epoch'] + 1, args.epochs):
         F_0_1 = flowOut[:,:2,:,:]
         F_1_0 = flowOut[:,2:,:,:]
         
-        fCoeff = superslomo.getFlowCoeff(trainFrameIndex, device)
+        fCoeff = superslomo.getFlowCoeff(trainFrameIndex, device, seq_len)
         
         # Calculate intermediate flows
         F_t_0 = fCoeff[0] * F_0_1 + fCoeff[1] * F_1_0
@@ -337,7 +455,7 @@ for epoch in range(dict1['epoch'] + 1, args.epochs):
         g_I0_F_t_0_f = trainFlowBackWarp(I0, F_t_0_f)
         g_I1_F_t_1_f = trainFlowBackWarp(I1, F_t_1_f)
         
-        wCoeff = superslomo.getWarpCoeff(trainFrameIndex, device)
+        wCoeff = superslomo.getWarpCoeff(trainFrameIndex, device, seq_len)
         
         # Calculate final intermediate frame 
         Ft_p = (wCoeff[0] * V_t_0 * g_I0_F_t_0_f + wCoeff[1] * V_t_1 * g_I1_F_t_1_f) / (wCoeff[0] * V_t_0 + wCoeff[1] * V_t_1)

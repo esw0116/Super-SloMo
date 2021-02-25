@@ -247,7 +247,7 @@ class SuperSloMo(data.Dataset):
                 image = self.transform(image)
             sample.append(image)
             
-        return sample, returnIndex
+        return sample, returnIndex, self.framesPath[index]
 
 
     def __len__(self):

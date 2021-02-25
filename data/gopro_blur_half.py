@@ -104,7 +104,12 @@ class GoPro(data.Dataset):
         raise ValueError()
 
     def __getitem__(self, idx):
-        key, index = self._find_key(idx)
+        if self.train:
+            half = idx % 2
+            idx = idx // 2
+            key, index = self._find_key(idx)
+        else:
+            key, index = self._find_key(idx)
         if self.train:
             filepath_list = [self.data_dict[key][i] for i in range(index, index+self.seq_len)]
         else:
@@ -116,7 +121,8 @@ class GoPro(data.Dataset):
                 filepath_list.reverse()
 
         sample = []
-        
+        s_len = self.seq_len // 2 + 1
+
         if self.train:
             ### Data Augmentation ###
             # 11 frames in a clip
@@ -127,7 +133,11 @@ class GoPro(data.Dataset):
             cropArea = (cropX, cropY, cropX + self.randomCropSize[0], cropY + self.randomCropSize[1])
             # Random reverse frame
             # frameRange = range(firstFrame, firstFrame + 9) if (random.randint(0, 1)) else range(firstFrame + 8, firstFrame - 1, -1)
-            IFrameIndex = random.randint(firstFrame + 1, firstFrame + self.seq_len-2)
+            while True:
+                IFrameIndex = random.randint(firstFrame + 1, firstFrame + self.seq_len-2)
+                if not IFrameIndex == firstFrame + self.seq_len // 2:
+                    break
+
             if random.randint(0, 1):
                 # frameRange = [firstFrame, IFrameIndex, firstFrame + 10]
                 frameRange = [i for i in range(firstFrame, firstFrame + self.seq_len)]
@@ -144,6 +154,8 @@ class GoPro(data.Dataset):
             firstFrame = 0
             cropArea = (0, 0, self.randomCropSize[0], self.randomCropSize[1])
             IFrameIndex = index % (self.seq_len-2)  + 1
+            if IFrameIndex == firstFrame + self.seq_len // 2:
+                IFrameIndex = IFrameIndex - 1
             returnIndex = IFrameIndex - 1
             # frameRange = [0, IFrameIndex, 10]
             frameRange = [i for i in range(self.seq_len)]
