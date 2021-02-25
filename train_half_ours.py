@@ -33,6 +33,7 @@ parser.add_argument("--checkpoint_dir", type=str, required=True, help='path to f
 parser.add_argument("--checkpoint", type=str, help='path of checkpoint for pretrained model')
 parser.add_argument("--train_continue", action='store_true', help='If resuming from checkpoint, set to True and set `checkpoint` path. Default: False.')
 parser.add_argument("--test_only", action='store_true', help='If resuming from checkpoint, set to True and set `checkpoint` path. Default: False.')
+parser.add_argument("--add_blur", action='store_true', help='Add blurry image')
 parser.add_argument("--epochs", type=int, default=40, help='number of epochs to train. Default: 200.')
 parser.add_argument("--seq_len", type=int, default=11, help='number of frames that composes a sequence.')
 parser.add_argument("--train_batch_size", type=int, default=8, help='batch size for training. Default: 6.')
@@ -57,7 +58,10 @@ scaler = torch.cuda.amp.GradScaler()
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 flowComp = superslomo.UNet(6, 4)
 flowComp.to(device)
-ArbTimeFlowIntrp = superslomo.UNet(20, 5)
+if args.add_blur:
+    ArbTimeFlowIntrp = superslomo.UNet(23, 5)
+else:
+    ArbTimeFlowIntrp = superslomo.UNet(20, 5)
 ArbTimeFlowIntrp.to(device)
 
 
@@ -207,8 +211,11 @@ def validate():
                     g_I0_F_t_0 = validationFlowBackWarp(I0, F_t_0)
                     g_I1_F_t_1 = validationFlowBackWarp(I1, F_t_1)
                     
-                    intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
-                        
+                    if args.add_blur:
+                        intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0, blurred_img), dim=1))
+                    else:
+                        intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
+                    
                     F_t_0_f = intrpOut[:, :2, :, :] + F_t_0
                     F_t_1_f = intrpOut[:, 2:4, :, :] + F_t_1
                     V_t_0   = torch.sigmoid(intrpOut[:, 4:5, :, :])
@@ -247,8 +254,11 @@ def validate():
                 g_I0_F_t_0 = validationFlowBackWarp(I0, F_t_0)
                 g_I1_F_t_1 = validationFlowBackWarp(I1, F_t_1)
                 
-                intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
-                    
+                if args.add_blur:
+                    intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0, blurred_img), dim=1))
+                else:
+                    intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
+                
                 F_t_0_f = intrpOut[:, :2, :, :] + F_t_0
                 F_t_1_f = intrpOut[:, 2:4, :, :] + F_t_1
                 V_t_0   = torch.sigmoid(intrpOut[:, 4:5, :, :])
@@ -360,7 +370,10 @@ def test():
                     g_I0_F_t_0 = validationFlowBackWarp(I0, F_t_0)
                     g_I1_F_t_1 = validationFlowBackWarp(I1, F_t_1)
                     
-                    intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
+                    if args.add_blur:
+                        intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0, blurred_img), dim=1))
+                    else:
+                        intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
                     
                     F_t_0_f = intrpOut[:, :2, :, :] + F_t_0
                     F_t_1_f = intrpOut[:, 2:4, :, :] + F_t_1
@@ -493,8 +506,11 @@ for epoch in range(dict1['epoch'] + 1, args.epochs):
                 g_I1_F_t_1 = trainFlowBackWarp(I1, F_t_1)
                 
                 # Calculate optical flow residuals and visibility maps
-                intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
-                
+                if args.add_blur:
+                    intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0, blurred_img), dim=1))
+                else:
+                    intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
+
                 # Extract optical flow residuals and visibility maps
                 F_t_0_f = intrpOut[:, :2, :, :] + F_t_0
                 F_t_1_f = intrpOut[:, 2:4, :, :] + F_t_1
@@ -550,7 +566,10 @@ for epoch in range(dict1['epoch'] + 1, args.epochs):
             g_I1_F_t_1 = trainFlowBackWarp(I1, F_t_1)
             
             # Calculate optical flow residuals and visibility maps
-            intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
+            if args.add_blur:
+                intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0, blurred_img), dim=1))
+            else:
+                intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
             
             # Extract optical flow residuals and visibility maps
             F_t_0_f = intrpOut[:, :2, :, :] + F_t_0
