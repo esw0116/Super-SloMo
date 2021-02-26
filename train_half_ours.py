@@ -15,7 +15,7 @@ from model import superslomo_half as superslomo
 from model.extraction import center, ends
 from data import gopro_blur_half as gopro_blur
 import dataloader
-from utils import quantize, eval_metrics
+from utils import quantize, eval_metrics, meanshift
 
 from copy import deepcopy
 from math import log10
@@ -34,10 +34,11 @@ parser.add_argument("--checkpoint", type=str, help='path of checkpoint for pretr
 parser.add_argument("--train_continue", action='store_true', help='If resuming from checkpoint, set to True and set `checkpoint` path. Default: False.')
 parser.add_argument("--test_only", action='store_true', help='If resuming from checkpoint, set to True and set `checkpoint` path. Default: False.')
 parser.add_argument("--add_blur", action='store_true', help='Add blurry image')
+parser.add_argument("--extract11", action='store_true', help='Add blurry image')
 parser.add_argument("--epochs", type=int, default=40, help='number of epochs to train. Default: 200.')
 parser.add_argument("--seq_len", type=int, default=11, help='number of frames that composes a sequence.')
 parser.add_argument("--train_batch_size", type=int, default=8, help='batch size for training. Default: 6.')
-parser.add_argument("--validation_batch_size", type=int, default=2, help='batch size for validation. Default: 10.')
+parser.add_argument("--validation_batch_size", type=int, default=4, help='batch size for validation. Default: 10.')
 parser.add_argument("--init_learning_rate", type=float, default=0.0001, help='set initial learning rate. Default: 0.0001.')
 parser.add_argument("--milestones", type=list, default=[20, 30], help='Set to epoch values where you want to decrease learning rate by a factor of 0.1. Default: [100, 150]')
 parser.add_argument("--progress_iter", type=int, default=1000, help='frequency of reporting progress and validation. N: after every N iterations. Default: 100.')
@@ -78,7 +79,13 @@ validationFlowBackWarp = validationFlowBackWarp.to(device)
 center_estimation = center.Center()
 border_estimation = ends.Ends()
 
-pretrained_weight = torch.load('pretrained_models/best_gopro.ckpt')['state_dict']
+if not args.extract11:
+    print('Estimation Network: best_gopro07.ckpt')
+    pretrained_weight = torch.load('pretrained_models/best_gopro07.ckpt')['state_dict']
+else:
+    print('Estimation Network: best_gopro11.ckpt')
+    pretrained_weight = torch.load('pretrained_models/best_gopro11.ckpt')['state_dict']
+
 center_state_dict = {}
 ends_state_dict = {}
 for key, value in pretrained_weight.items():
@@ -93,7 +100,6 @@ center_estimation.load_state_dict(center_state_dict)
 border_estimation.load_state_dict(ends_state_dict)
 center_estimation = center_estimation.to(device)
 border_estimation = border_estimation.to(device)
-print('Estimation network')
 
 ### Load Datasets
 
@@ -122,7 +128,7 @@ TP = transforms.Compose([revNormalize, transforms.ToPILImage()])
 
 
 ###Utils
-    
+
 def get_lr(optimizer):
     for param_group in optimizer.param_groups:
         return param_group['lr']
@@ -134,10 +140,12 @@ seq_len = args.seq_len
 ctr_idx = seq_len // 2
 L1_lossFn = nn.L1Loss()
 MSE_LossFn = nn.MSELoss()
+compare_ftn = nn.L1Loss(reduction='none')
 
 params = list(ArbTimeFlowIntrp.parameters()) + list(flowComp.parameters())
 
 optimizer = optim.Adam(params, lr=args.init_learning_rate)
+
 # scheduler to decrease learning rate by a factor of 10 at milestones.
 scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.milestones, gamma=0.1)
 
@@ -149,7 +157,6 @@ vgg16_conv_4_3.to(device)
 for param in vgg16_conv_4_3.parameters():
 		param.requires_grad = False
 
-compare_ftn = nn.L1Loss(reduction='none')
 
 ### Validation function
 
@@ -172,8 +179,13 @@ def validate():
             blurred_img /= len(validationData)
             blurred_img = blurred_img.to(device)
             
+            blurred_img = meanshift(blurred_img, mean, std, device, False)
             center = center_estimation(blurred_img)
             start, end = border_estimation(blurred_img, center)
+            start = meanshift(start, mean, std, device, True)
+            end = meanshift(end, mean, std, device, True)
+            center = meanshift(center, mean, std, device, True)
+            blurred_img = meanshift(blurred_img, mean, std, device, True)
 
             frame0 = validationData[0].to(device)
             frame1 = validationData[-1].to(device)
@@ -182,21 +194,26 @@ def validate():
             parallel = torch.mean(compare_ftn(start, frame0) + compare_ftn(end, frame1), dim=(1,2,3))
             cross = torch.mean(compare_ftn(start, frame1) + compare_ftn(end, frame0), dim=(1,2,3))
 
-            I0 = torch.zeros_like(blurred_img)
-            I1 = center
+            # I0 = torch.zeros_like(blurred_img)
             IFrame = torch.zeros_like(I0)
+            choose_start = torch.zeros(batch_size).to(device)
 
             for b in range(batch_size):
                 if (validationFrameIndex[b] < (ctr_idx - 1) and parallel[b] <= cross[b]) or (validationFrameIndex[b] > (ctr_idx - 1) and parallel[b] > cross[b]):
-                    I0[b] = start[b]
+                    # I0[b] = start[b]
+                    choose_start[b] = 1
                 else:
-                    I0[b] = end[b]
+                    # I0[b] = end[b]
+                    choose_start[b] = 0
 
-                IFrame[b] = validationData[validationFrameIndex[b]+1][b]
-
+                IFrame[b] = trainData[validationFrameIndex[b]+1][b]
                 if validationFrameIndex[b] > (ctr_idx - 1):
                     validationFrameIndex[b] = seq_len - 3 - validationFrameIndex[b]
-            
+
+            choose_start = choose_start.reshape((-1, 1, 1, 1))
+            I0 = choose_start * start + (1-choose_start) * end
+            I1 = center
+
             if args.amp:
                 with torch.cuda.amp.autocast():
                     flowOut = flowComp(torch.cat((I0, I1), dim=1))
@@ -316,7 +333,7 @@ def test():
         os.mkdir(imgsave_folder)
 
     with torch.no_grad():
-        for validationIndex, (validationData, validationFrameIndex, validationFile) in enumerate(tqdm_loader):
+        for validationIdx, (validationData, _, validationFile) in enumerate(tqdm_loader):
             
             blurred_img = torch.zeros_like(validationData[0])
             for image in validationData:
@@ -325,39 +342,66 @@ def test():
             blurred_img = blurred_img.to(device)
             batch_size = blurred_img.shape[0]
 
+            blurred_img = meanshift(blurred_img, mean, std, device, False)
             center = center_estimation(blurred_img)
             start, end = border_estimation(blurred_img, center)
 
-            compare_ftn = nn.L1Loss()
+            # start, end, center = quantize(start, rgb_range=255), quantize(end, rgb_range=255), quantize(center, rgb_range=255)
+
+            start = meanshift(start, mean, std, device, True)
+            end = meanshift(end, mean, std, device, True)
+            center = meanshift(center, mean, std, device, True)
+            blurred_img = meanshift(blurred_img, mean, std, device, True)
+
             frame0 = validationData[0].to(device)
             frame1 = validationData[-1].to(device)
-            parallel = True if compare_ftn(start, frame0) + compare_ftn(end, frame1) <= compare_ftn(start, frame1) + compare_ftn(end, frame0) else False
+            
+            batch_size = blurred_img.shape[0]
+            parallel = torch.mean(compare_ftn(start, frame0) + compare_ftn(end, frame1), dim=(1,2,3))
+            cross = torch.mean(compare_ftn(start, frame1) + compare_ftn(end, frame0), dim=(1,2,3))
 
-            if parallel:
-                I0, I1 = start, end
-            else:
-                I0, I1 = end, start
-            '''
-            I0 = validationData[0].to(device)
-            I1 = validationData[-1].to(device)
-            batch_size = I0.shape[0]
-            '''
+            I0 = torch.zeros_like(blurred_img)
+            I1 = center
+            
             psnrs = np.zeros((batch_size, seq_len))
             ssims = np.zeros((batch_size, seq_len))
 
             for vindex in range(seq_len):                    
                 frameT = validationData[vindex]
                 IFrame = frameT.to(device)
-
+                
                 if vindex == 0:
-                    Ft_p = I0.clone()
+                    Ft_p = torch.zeros_like(blurred_img)
+                    for b in range(batch_size):
+                        if parallel[b] <= cross[b]:
+                            Ft_p[b] = start[b].clone()
+                        else:
+                            Ft_p[b] = end[b].clone()
 
                 elif vindex == seq_len-1:
-                    Ft_p = I1.clone()
+                    Ft_p = torch.zeros_like(blurred_img)
+                    for b in range(batch_size):
+                        if parallel[b] <= cross[b]:
+                            Ft_p[b] = end[b].clone()
+                        else:
+                            Ft_p[b] = start[b].clone()
+
+                elif vindex == ctr_idx:
+                    Ft_p = center.clone()
 
                 else:
                     validationIndex = torch.ones(batch_size) * (vindex - 1)
                     validationIndex = validationIndex.long()
+                    if vindex > ctr_idx:
+                        validationIndex = seq_len - 3 - validationIndex
+
+                    for b in range(batch_size):
+                        if (vindex < ctr_idx and parallel[b] <= cross[b]) or (vindex > ctr_idx and parallel[b] > cross[b]):
+                            I0[b] = start[b]
+                        else:
+                            I0[b] = end[b]
+
+
                     flowOut = flowComp(torch.cat((I0, I1), dim=1))
                     F_0_1 = flowOut[:,:2,:,:]
                     F_1_0 = flowOut[:,2:,:,:]
@@ -387,19 +431,21 @@ def test():
                     
                     Ft_p = (wCoeff[0] * V_t_0 * g_I0_F_t_0_f + wCoeff[1] * V_t_1 * g_I1_F_t_1_f) / (wCoeff[0] * V_t_0 + wCoeff[1] * V_t_1)
                 
-                # for b in range(batch_size):
-                #     foldername = os.path.basename(os.path.dirname(validationFile[ctr_idx][b]))
-                #     filename = os.path.splitext(os.path.basename(validationFile[vindex][b]))[0]
+                Ft_p = meanshift(Ft_p, mean, std, device, False)
+                IFrame = meanshift(IFrame, mean, std, device, False)
+
+                for b in range(batch_size):
+                    foldername = os.path.basename(os.path.dirname(validationFile[ctr_idx][b]))
+                    filename = os.path.splitext(os.path.basename(validationFile[vindex][b]))[0]
                     
-                #     out_fname = foldername + '_' + filename + '_out.png'
-                #     gt_fname = foldername + '_' + filename + '.png'
+                    out_fname = foldername + '_' + filename + '_out.png'
+                    gt_fname = foldername + '_' + filename + '.png'
 
-                #     Ft_p[b] = revNormalize(Ft_p[b])
-                #     IFrame[b] = revNormalize(IFrame[b])
-                #     out, gt = quantize(Ft_p[b]), quantize(IFrame[b])
+                    # Comment two lines below if you want to save images
+                    # out, gt = quantize(Ft_p[b]), quantize(IFrame[b])
 
-                #     torchvision.utils.save_image(out, os.path.join(imgsave_folder, out_fname), normalize=True, range=(0,255))
-                #     torchvision.utils.save_image(gt, os.path.join(imgsave_folder, gt_fname), normalize=True, range=(0,255))
+                    # torchvision.utils.save_image(out, os.path.join(imgsave_folder, out_fname), normalize=True, range=(0,255))
+                    # torchvision.utils.save_image(gt, os.path.join(imgsave_folder, gt_fname), normalize=True, range=(0,255))
 
                 psnr, ssim = eval_metrics(Ft_p, IFrame)
                 psnrs[:, vindex] = psnr.cpu().numpy()
@@ -410,7 +456,7 @@ def test():
                 rows.extend(list(psnrs[b]))
                 df = df.append(pd.Series(rows, index=df.columns), ignore_index=True)
             
-        df.to_csv('{}/results_PSNR.csv'.format(args.checkpoint_dir))
+            df.to_csv('{}/results_PSNR.csv'.format(args.checkpoint_dir))
 
 
 ### Initialization
@@ -460,8 +506,13 @@ for epoch in range(dict1['epoch'] + 1, args.epochs):
         blurred_img = blurred_img.to(device)
         
         with torch.no_grad():
+            blurred_img = meanshift(blurred_img, mean, std, device, False)
             center = center_estimation(blurred_img)
             start, end = border_estimation(blurred_img, center)
+            start = meanshift(start, mean, std, device, True)
+            end = meanshift(end, mean, std, device, True)
+            center = meanshift(center, mean, std, device, True)
+            blurred_img = meanshift(blurred_img, mean, std, device, True)
 
         frame0 = trainData[0].to(device)
         frame1 = trainData[-1].to(device)
@@ -470,20 +521,26 @@ for epoch in range(dict1['epoch'] + 1, args.epochs):
         parallel = torch.mean(compare_ftn(start, frame0) + compare_ftn(end, frame1), dim=(1,2,3))
         cross = torch.mean(compare_ftn(start, frame1) + compare_ftn(end, frame0), dim=(1,2,3))
 
-        I0 = torch.zeros_like(blurred_img)
-        I1 = center
+        # I0 = torch.zeros_like(blurred_img)
         IFrame = torch.zeros_like(I0)
+        choose_start = torch.zeros(batch_size).to(device)
 
         for b in range(batch_size):
             if (trainFrameIndex[b] < (ctr_idx - 1) and parallel[b] <= cross[b]) or (trainFrameIndex[b] > (ctr_idx - 1) and parallel[b] > cross[b]):
-                I0[b] = start[b]
+                # I0[b] = start[b]
+                choose_start[b] = 1
             else:
-                I0[b] = end[b]
+                # I0[b] = end[b]
+                choose_start[b] = 0
 
             IFrame[b] = trainData[trainFrameIndex[b]+1][b]
-
             if trainFrameIndex[b] > (ctr_idx - 1):
                 trainFrameIndex[b] = seq_len - 3 - trainFrameIndex[b]
+
+        choose_start = choose_start.reshape((-1, 1, 1, 1))
+        I0 = choose_start * start + (1-choose_start) * end
+        I1 = center
+
         optimizer.zero_grad()
 
         if args.amp:

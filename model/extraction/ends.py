@@ -120,8 +120,8 @@ class Ends(nn.Module):
         self.regenerateFrame_first = N8_IN()
 
     def forward(self, Blurry, ref4):
-        ref1 = self.generateFrame_first(Blurry, ref4, ref4) + ref4
-        ref7 = self.generateFrame_last(Blurry, ref4, ref1) + ref4
+        ref1_ = self.generateFrame_first(Blurry, ref4, ref4) + ref4
+        ref7 = self.generateFrame_last(Blurry, ref4, ref1_) + ref4
         ref1 = self.regenerateFrame_first(Blurry, ref4, ref7) + ref4
 
         return ref1, ref7

@@ -11,9 +11,9 @@ import torch.optim as optim
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 
-from model import superslomo
+from model import superslomo_half as superslomo
 from model.extraction import center, ends
-from data import gopro_blur as gopro_blur
+from data import gopro_blur_half as gopro_blur
 import dataloader
 from utils import quantize, eval_metrics, meanshift
 
@@ -53,12 +53,12 @@ if not os.path.exists(args.checkpoint_dir):
     os.makedirs(args.checkpoint_dir)
 
 scaler = torch.cuda.amp.GradScaler()
+
 ###Initialize flow computation and arbitrary-time flow interpolation CNNs.
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 flowComp = superslomo.UNet(6, 4)
 flowComp.to(device)
-
 if args.add_blur:
     ArbTimeFlowIntrp = superslomo.UNet(23, 5)
 else:
@@ -100,24 +100,14 @@ center_estimation.load_state_dict(center_state_dict)
 border_estimation.load_state_dict(ends_state_dict)
 center_estimation = center_estimation.to(device)
 border_estimation = border_estimation.to(device)
-center_estimation.eval()
-border_estimation.eval()
 print('Estimation network')
 
 ### Load Datasets
-
-
 # Channel wise mean calculated on adobe240-fps training dataset
 mean = [0.429, 0.431, 0.397]
 std  = [1, 1, 1]
 normalize = transforms.Normalize(mean=mean, std=std)
 transform = transforms.Compose([transforms.ToTensor(), normalize])
-
-# trainset = dataloader.SuperSloMo(root=args.dataset_root + '/train', transform=transform, train=True)
-# trainloader = torch.utils.data.DataLoader(trainset, batch_size=args.train_batch_size, shuffle=True)
-
-# validationset = dataloader.SuperSloMo(root=args.dataset_root + '/validation', transform=transform, randomCropSize=(640, 352), train=False)
-# validationloader = torch.utils.data.DataLoader(validationset, batch_size=args.validation_batch_size, shuffle=False)
 
 # GoPro
 trainset = gopro_blur.GoPro(root=args.dataset_root, transform=transform, seq_len=args.seq_len, train=True)
@@ -137,11 +127,35 @@ TP = transforms.Compose([revNormalize, transforms.ToPILImage()])
 
 
 ###Utils
-    
 def get_lr(optimizer):
     for param_group in optimizer.param_groups:
         return param_group['lr']
 
+class MinimumOrderLoss(nn.Module):
+    def __init__(self, lossFn='L1'):
+        super(MinimumOrderLoss, self).__init__()
+        if lossFn == 'L1':
+            self.loss_ftn = nn.L1Loss(reduction='none')
+        elif lossFn == 'MSE':
+            self.loss_ftn = nn.MSELoss(reduction='none')
+
+    def forward(self, output, gt):
+        assert len(output) == len(gt)
+        # Forward order
+        forward_loss = torch.zeros_like(output[0])
+        for i in range(len(output)):
+            forward_loss += self.loss_ftn(output[i], gt[i])
+        forward_loss = torch.mean(forward_loss, dim=(1,2,3))
+
+        # Backward order
+        backward_loss = torch.zeros_like(output[0])
+        for i in range(len(output)):
+            backward_loss += self.loss_ftn(output[i], gt[len(output)-1-i])
+        backward_loss = torch.mean(backward_loss, dim=(1,2,3))
+
+        minimum_loss = torch.min(forward_loss, backward_loss)
+
+        return minimum_loss.mean()
 
 ###Loss and Optimizer
 
@@ -149,13 +163,16 @@ seq_len = args.seq_len
 ctr_idx = seq_len // 2
 L1_lossFn = nn.L1Loss()
 MSE_LossFn = nn.MSELoss()
+Minorder_LossFn = MinimumOrderLoss()
+compare_ftn = nn.L1Loss(reduction='none')
 
-params = list(ArbTimeFlowIntrp.parameters()) + list(flowComp.parameters())
+params_extract = border_estimation.parameters()
+params_interp = list(ArbTimeFlowIntrp.parameters()) + list(flowComp.parameters())
 
-optimizer = optim.Adam(params, lr=args.init_learning_rate)
+optimizer = optim.Adam([{'params': params_interp}, {'params': params_extract, 'lr': args.init_learning_rate / 5}], lr=args.init_learning_rate)
+
 # scheduler to decrease learning rate by a factor of 10 at milestones.
 scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.milestones, gamma=0.1)
-
 
 ###Initializing VGG16 model for perceptual loss
 
@@ -167,9 +184,7 @@ for param in vgg16_conv_4_3.parameters():
 
 compare_ftn = nn.L1Loss(reduction='none')
 
-
 ### Validation function
-
 
 def validate():
     # For details see training.
@@ -178,6 +193,12 @@ def validate():
     flag = 1
     with torch.no_grad():
         for validationIndex, (validationData, validationFrameIndex, _) in enumerate(validationloader, 0):
+            # frame0, frameT, frame1 = validationData
+
+            # I0 = frame0.to(device)
+            # I1 = frame1.to(device)
+            # IFrame = frameT.to(device)
+
             blurred_img = torch.zeros_like(validationData[0])
             for image in validationData:
                 blurred_img += image
@@ -185,10 +206,11 @@ def validate():
             blurred_img = blurred_img.to(device)
             
             blurred_img = meanshift(blurred_img, mean, std, device, False)
-            c = center_estimation(blurred_img)
-            start, end = border_estimation(blurred_img, c)
+            center = center_estimation(blurred_img)
+            start, end = border_estimation(blurred_img, center)
             start = meanshift(start, mean, std, device, True)
             end = meanshift(end, mean, std, device, True)
+            center = meanshift(center, mean, std, device, True)
             blurred_img = meanshift(blurred_img, mean, std, device, True)
 
             frame0 = validationData[0].to(device)
@@ -199,15 +221,19 @@ def validate():
             cross = torch.mean(compare_ftn(start, frame1) + compare_ftn(end, frame0), dim=(1,2,3))
 
             I0 = torch.zeros_like(blurred_img)
-            I1 = torch.zeros_like(blurred_img)
-            IFrame = torch.zeros_like(blurred_img)
+            I1 = center
+            IFrame = torch.zeros_like(I0)
+
             for b in range(batch_size):
-                if parallel[b] <= cross[b]:
-                    I0[b], I1[b] = start[b], end[b]
+                if (validationFrameIndex[b] < (ctr_idx - 1) and parallel[b] <= cross[b]) or (validationFrameIndex[b] > (ctr_idx - 1) and parallel[b] > cross[b]):
+                    I0[b] = start[b]
                 else:
-                    I0[b], I1[b] = end[b], start[b]
+                    I0[b] = end[b]
 
                 IFrame[b] = validationData[validationFrameIndex[b]+1][b]
+
+                if validationFrameIndex[b] > (ctr_idx - 1):
+                    validationFrameIndex[b] = seq_len - 3 - validationFrameIndex[b]
             
             if args.amp:
                 with torch.cuda.amp.autocast():
@@ -222,12 +248,12 @@ def validate():
 
                     g_I0_F_t_0 = validationFlowBackWarp(I0, F_t_0)
                     g_I1_F_t_1 = validationFlowBackWarp(I1, F_t_1)
-
+                    
                     if args.add_blur:
                         intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0, blurred_img), dim=1))
                     else:
                         intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
-
+                    
                     F_t_0_f = intrpOut[:, :2, :, :] + F_t_0
                     F_t_1_f = intrpOut[:, 2:4, :, :] + F_t_1
                     V_t_0   = torch.sigmoid(intrpOut[:, 4:5, :, :])
@@ -242,7 +268,9 @@ def validate():
                     
                     #loss
                     recnLoss = L1_lossFn(Ft_p, IFrame)
+                    
                     prcpLoss = MSE_LossFn(vgg16_conv_4_3(Ft_p), vgg16_conv_4_3(IFrame))
+                    
                     warpLoss = L1_lossFn(g_I0_F_t_0, IFrame) + L1_lossFn(g_I1_F_t_1, IFrame) + L1_lossFn(validationFlowBackWarp(I0, F_1_0), I1) + L1_lossFn(validationFlowBackWarp(I1, F_0_1), I0)
                 
                     loss_smooth_1_0 = torch.mean(torch.abs(F_1_0[:, :, :, :-1] - F_1_0[:, :, :, 1:])) + torch.mean(torch.abs(F_1_0[:, :, :-1, :] - F_1_0[:, :, 1:, :]))
@@ -283,7 +311,9 @@ def validate():
                 
                 #loss
                 recnLoss = L1_lossFn(Ft_p, IFrame)
+                
                 prcpLoss = MSE_LossFn(vgg16_conv_4_3(Ft_p), vgg16_conv_4_3(IFrame))
+                
                 warpLoss = L1_lossFn(g_I0_F_t_0, IFrame) + L1_lossFn(g_I1_F_t_1, IFrame) + L1_lossFn(validationFlowBackWarp(I0, F_1_0), I1) + L1_lossFn(validationFlowBackWarp(I1, F_0_1), I0)
             
                 loss_smooth_1_0 = torch.mean(torch.abs(F_1_0[:, :, :, :-1] - F_1_0[:, :, :, 1:])) + torch.mean(torch.abs(F_1_0[:, :, :-1, :] - F_1_0[:, :, 1:, :]))
@@ -292,12 +322,13 @@ def validate():
                 
                 loss = 204 * recnLoss + 102 * warpLoss + 0.005 * prcpLoss + loss_smooth
 
+            tloss += loss.item()
+            
             # For tensorboard
             if flag:
                 retImg = torchvision.utils.make_grid([revNormalize(frame0.cpu()[0]), revNormalize(IFrame.cpu()[0]), revNormalize(Ft_p.cpu()[0]), revNormalize(frame1.cpu()[0])], padding=10)
                 flag = 0
-
-            tloss += loss.item()
+            
             #psnr
             MSE_val = MSE_LossFn(Ft_p, IFrame)
             psnr += (10 * log10(1 / MSE_val.item()))
@@ -323,7 +354,7 @@ def test():
         os.mkdir(imgsave_folder)
 
     with torch.no_grad():
-        for validationIndex, (validationData, validationFrameIndex, validationFile) in enumerate(tqdm_loader):
+        for validationIndex, (validationData, _, validationFile) in enumerate(tqdm_loader):
             
             blurred_img = torch.zeros_like(validationData[0])
             for image in validationData:
@@ -333,10 +364,14 @@ def test():
             batch_size = blurred_img.shape[0]
 
             blurred_img = meanshift(blurred_img, mean, std, device, False)
-            c = center_estimation(blurred_img)
-            start, end = border_estimation(blurred_img, c)
+            center = center_estimation(blurred_img)
+            start, end = border_estimation(blurred_img, center)
+
+            # start, end, center = quantize(start, rgb_range=255), quantize(end, rgb_range=255), quantize(center, rgb_range=255)
+
             start = meanshift(start, mean, std, device, True)
             end = meanshift(end, mean, std, device, True)
+            center = meanshift(center, mean, std, device, True)
             blurred_img = meanshift(blurred_img, mean, std, device, True)
 
             frame0 = validationData[0].to(device)
@@ -347,29 +382,47 @@ def test():
             cross = torch.mean(compare_ftn(start, frame1) + compare_ftn(end, frame0), dim=(1,2,3))
 
             I0 = torch.zeros_like(blurred_img)
-            I1 = torch.zeros_like(blurred_img)
-            for b in range(batch_size):
-                if parallel[b] <= cross[b]:
-                    I0[b], I1[b] = start[b], end[b]
-                else:
-                    I0[b], I1[b] = end[b], start[b]
-
+            I1 = center
+            
             psnrs = np.zeros((batch_size, seq_len))
             ssims = np.zeros((batch_size, seq_len))
 
             for vindex in range(seq_len):                    
                 frameT = validationData[vindex]
                 IFrame = frameT.to(device)
-
+                
                 if vindex == 0:
-                    Ft_p = I0.clone()
+                    Ft_p = torch.zeros_like(blurred_img)
+                    for b in range(batch_size):
+                        if parallel[b] <= cross[b]:
+                            Ft_p[b] = start[b].clone()
+                        else:
+                            Ft_p[b] = end[b].clone()
 
                 elif vindex == seq_len-1:
-                    Ft_p = I1.clone()
+                    Ft_p = torch.zeros_like(blurred_img)
+                    for b in range(batch_size):
+                        if parallel[b] <= cross[b]:
+                            Ft_p[b] = end[b].clone()
+                        else:
+                            Ft_p[b] = start[b].clone()
+
+                elif vindex == ctr_idx:
+                    Ft_p = center.clone()
 
                 else:
                     validationIndex = torch.ones(batch_size) * (vindex - 1)
                     validationIndex = validationIndex.long()
+                    if vindex > ctr_idx:
+                        validationIndex = seq_len - 3 - validationIndex
+
+                    for b in range(batch_size):
+                        if (vindex < ctr_idx and parallel[b] <= cross[b]) or (vindex > ctr_idx and parallel[b] > cross[b]):
+                            I0[b] = start[b]
+                        else:
+                            I0[b] = end[b]
+
+
                     flowOut = flowComp(torch.cat((I0, I1), dim=1))
                     F_0_1 = flowOut[:,:2,:,:]
                     F_1_0 = flowOut[:,2:,:,:]
@@ -402,13 +455,14 @@ def test():
                 Ft_p = meanshift(Ft_p, mean, std, device, False)
                 IFrame = meanshift(IFrame, mean, std, device, False)
 
-                for b in range(batch_size):
-                    foldername = os.path.basename(os.path.dirname(validationFile[ctr_idx][b]))
-                    filename = os.path.splitext(os.path.basename(validationFile[vindex][b]))[0]
+                # for b in range(batch_size):
+                #     foldername = os.path.basename(os.path.dirname(validationFile[ctr_idx][b]))
+                #     filename = os.path.splitext(os.path.basename(validationFile[vindex][b]))[0]
                     
-                    out_fname = foldername + '_' + filename + '_out.png'
-                    gt_fname = foldername + '_' + filename + '.png'
-                    out, gt = quantize(Ft_p[b]), quantize(IFrame[b])
+                #     out_fname = foldername + '_' + filename + '_out.png'
+                #     gt_fname = foldername + '_' + filename + '.png'
+
+                #     out, gt = quantize(Ft_p[b]), quantize(IFrame[b])
 
                     # Comment two lines below if you want to save images
                     # torchvision.utils.save_image(out, os.path.join(imgsave_folder, out_fname), normalize=True, range=(0,255))
@@ -431,7 +485,7 @@ if args.train_continue or args.test_only:
     dict1 = torch.load(args.checkpoint)
     ArbTimeFlowIntrp.load_state_dict(dict1['state_dictAT'])
     flowComp.load_state_dict(dict1['state_dictFC'])
-    print('Pretrained Model Loaded...')
+    print()
 else:
     dict1 = {'loss': [], 'valLoss': [], 'valPSNR': [], 'epoch': -1}
 
@@ -471,38 +525,45 @@ for epoch in range(dict1['epoch'] + 1, args.epochs):
             blurred_img += image
         blurred_img /= len(trainData)
         blurred_img = blurred_img.to(device)
-        
-        with torch.no_grad():
-            blurred_img = meanshift(blurred_img, mean, std, device, False)
-            c = center_estimation(blurred_img)
-            start, end = border_estimation(blurred_img, c)
-            start = meanshift(start, mean, std, device, True)
-            end = meanshift(end, mean, std, device, True)
-            blurred_img = meanshift(blurred_img, mean, std, device, True)
-
+        blurred_img = meanshift(blurred_img, mean, std, device, False)
 
         frame0 = trainData[0].to(device)
         frame1 = trainData[-1].to(device)
+
+        optimizer.zero_grad()
+
+        with torch.no_grad():
+            center = center_estimation(blurred_img)
+        start, end = border_estimation(blurred_img, center)
+
+        start = meanshift(start, mean, std, device, True)
+        end = meanshift(end, mean, std, device, True)
+        center = meanshift(center, mean, std, device, True)
+        blurred_img = meanshift(blurred_img, mean, std, device, True)
 
         batch_size = blurred_img.shape[0]
         parallel = torch.mean(compare_ftn(start, frame0) + compare_ftn(end, frame1), dim=(1,2,3))
         cross = torch.mean(compare_ftn(start, frame1) + compare_ftn(end, frame0), dim=(1,2,3))
 
         I0 = torch.zeros_like(blurred_img)
-        I1 = torch.zeros_like(blurred_img)
-        IFrame = torch.zeros_like(blurred_img)
+        I1 = center
+        IFrame = torch.zeros_like(I0)
+
         for b in range(batch_size):
-            if parallel[b] <= cross[b]:
-                I0[b], I1[b] = start[b], end[b]
+            if (trainFrameIndex[b] < (ctr_idx - 1) and parallel[b] <= cross[b]) or (trainFrameIndex[b] > (ctr_idx - 1) and parallel[b] > cross[b]):
+                I0[b] = start[b]
             else:
-                I0[b], I1[b] = end[b], start[b]
+                I0[b] = end[b]
 
             IFrame[b] = trainData[trainFrameIndex[b]+1][b]
-        
-        optimizer.zero_grad()
-        
+
+            if trainFrameIndex[b] > (ctr_idx - 1):
+                trainFrameIndex[b] = seq_len - 3 - trainFrameIndex[b]
+
         if args.amp:
             with torch.cuda.amp.autocast():
+                EdgeLoss = Minorder_LossFn([start, end], [frame0, frame1])
+
                 # Calculate flow between reference frames I0 and I1
                 flowOut = flowComp(torch.cat((I0, I1), dim=1))
                 
@@ -525,7 +586,7 @@ for epoch in range(dict1['epoch'] + 1, args.epochs):
                     intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0, blurred_img), dim=1))
                 else:
                     intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
-                
+
                 # Extract optical flow residuals and visibility maps
                 F_t_0_f = intrpOut[:, :2, :, :] + F_t_0
                 F_t_1_f = intrpOut[:, 2:4, :, :] + F_t_1
@@ -555,14 +616,16 @@ for epoch in range(dict1['epoch'] + 1, args.epochs):
                 # Total Loss - Coefficients 204 and 102 are used instead of 0.8 and 0.4
                 # since the loss in paper is calculated for input pixels in range 0-255
                 # and the input to our network is in range 0-1
-                loss = 204 * recnLoss + 102 * warpLoss + 0.005 * prcpLoss + loss_smooth
-                
+                loss = 102 * EdgeLoss + 204 * recnLoss + 102 * warpLoss + 0.005 * prcpLoss + loss_smooth
+        
             # Backpropagate
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
         else:
+            EdgeLoss = Minorder_LossFn([start, end], [frame0, frame1])
+
             # Calculate flow between reference frames I0 and I1
             flowOut = flowComp(torch.cat((I0, I1), dim=1))
             
@@ -585,6 +648,7 @@ for epoch in range(dict1['epoch'] + 1, args.epochs):
                 intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0, blurred_img), dim=1))
             else:
                 intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
+            
             # Extract optical flow residuals and visibility maps
             F_t_0_f = intrpOut[:, :2, :, :] + F_t_0
             F_t_1_f = intrpOut[:, 2:4, :, :] + F_t_1
@@ -602,9 +666,7 @@ for epoch in range(dict1['epoch'] + 1, args.epochs):
             
             # Loss
             recnLoss = L1_lossFn(Ft_p, IFrame)
-                
             prcpLoss = MSE_LossFn(vgg16_conv_4_3(Ft_p), vgg16_conv_4_3(IFrame))
-            
             warpLoss = L1_lossFn(g_I0_F_t_0, IFrame) + L1_lossFn(g_I1_F_t_1, IFrame) + L1_lossFn(trainFlowBackWarp(I0, F_1_0), I1) + L1_lossFn(trainFlowBackWarp(I1, F_0_1), I0)
             
             loss_smooth_1_0 = torch.mean(torch.abs(F_1_0[:, :, :, :-1] - F_1_0[:, :, :, 1:])) + torch.mean(torch.abs(F_1_0[:, :, :-1, :] - F_1_0[:, :, 1:, :]))
@@ -614,13 +676,14 @@ for epoch in range(dict1['epoch'] + 1, args.epochs):
             # Total Loss - Coefficients 204 and 102 are used instead of 0.8 and 0.4
             # since the loss in paper is calculated for input pixels in range 0-255
             # and the input to our network is in range 0-1
-            loss = 204 * recnLoss + 102 * warpLoss + 0.005 * prcpLoss + loss_smooth
-            
+            loss = 102 * EdgeLoss + 204 * recnLoss + 102 * warpLoss + 0.005 * prcpLoss + loss_smooth
+    
             # Backpropagate
             loss.backward()
             optimizer.step()
 
         iLoss += loss.item()
+
     # Validation and progress every `args.progress_iter` iterations
     # if (trainIndex % args.progress_iter) == args.progress_iter - 1:
     endtime = time.time()
@@ -642,10 +705,6 @@ for epoch in range(dict1['epoch'] + 1, args.epochs):
     endVal = time.time()
     
     print("Loss: %0.6f TrainExecTime: %0.1f  ValLoss:%0.6f  ValPSNR: %0.4f  ValEvalTime: %0.2f LR: %f" % (iLoss / len(trainloader),  endtime - starttime, vLoss, psnr, endVal - endtime, get_lr(optimizer)))
-    
-    cLoss[epoch].append(iLoss/len(trainloader))
-    iLoss = 0
-    starttime = time.time()
         
     # Increment scheduler count    
     scheduler.step()

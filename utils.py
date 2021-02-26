@@ -7,11 +7,26 @@ from typing import Any
 from pytorch_msssim import ssim as ssim_pth
 
 
+def meanshift(batch, rgb_mean, rgb_std, device, norm=True):
+    if isinstance(rgb_mean, list):
+        rgb_mean = torch.Tensor(rgb_mean)
+    if isinstance(rgb_std, list):
+        rgb_std = torch.Tensor(rgb_std)
+
+    rgb_mean = rgb_mean.reshape(1,3,1,1).to(device)
+    rgb_std = rgb_std.reshape(1,3,1,1).to(device)
+
+    if norm:
+        return (batch - rgb_mean) / rgb_std
+    else:
+        return (batch * rgb_std) + rgb_mean
+
+
 def quantize(img, rgb_range=1):
     # change to 0~255
     if isinstance(img, torch.Tensor):
         img = img.clamp(0, 1)
-        img = img.mul(255/rgb_range).round()
+        img = img.mul(255).round().div(rgb_range)
     
     elif isinstance(img, np.ndarray):
         img = img.clip(0, 1)

@@ -44,7 +44,6 @@ def pixel_reshuffle(input, upscale_factor):
     shuffle_out = input_view.permute(0,1,3,5,2,4).contiguous()
     return shuffle_out.view(batch_size, channels, out_height, out_width)
 
-
 class FourDilateConvResBlockIN(nn.Module):
     def __init__(self, in_channels, out_channels, dilation2, dilation4):
         super(FourDilateConvResBlockIN, self).__init__()
