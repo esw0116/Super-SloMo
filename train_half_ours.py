@@ -195,7 +195,7 @@ def validate():
             cross = torch.mean(compare_ftn(start, frame1) + compare_ftn(end, frame0), dim=(1,2,3))
 
             # I0 = torch.zeros_like(blurred_img)
-            IFrame = torch.zeros_like(I0)
+            IFrame = torch.zeros_like(blurred_img)
             choose_start = torch.zeros(batch_size).to(device)
 
             for b in range(batch_size):
@@ -206,7 +206,7 @@ def validate():
                     # I0[b] = end[b]
                     choose_start[b] = 0
 
-                IFrame[b] = trainData[validationFrameIndex[b]+1][b]
+                IFrame[b] = validationData[validationFrameIndex[b]+1][b]
                 if validationFrameIndex[b] > (ctr_idx - 1):
                     validationFrameIndex[b] = seq_len - 3 - validationFrameIndex[b]
 
@@ -434,17 +434,18 @@ def test():
                 Ft_p = meanshift(Ft_p, mean, std, device, False)
                 IFrame = meanshift(IFrame, mean, std, device, False)
 
+                out = quantize(Ft_p[b])
+                foldername = os.path.basename(os.path.dirname(validationFile[ctr_idx][b]))
+                if not os.path.exists(os.path.join(imgsave_folder, foldername)):
+                    os.makedirs(os.path.join(imgsave_folder, foldername))
                 for b in range(batch_size):
-                    foldername = os.path.basename(os.path.dirname(validationFile[ctr_idx][b]))
                     filename = os.path.splitext(os.path.basename(validationFile[vindex][b]))[0]
                     
                     out_fname = foldername + '_' + filename + '_out.png'
-                    gt_fname = foldername + '_' + filename + '.png'
+                    # gt_fname = foldername + '_' + filename + '.png'
 
                     # Comment two lines below if you want to save images
-                    # out, gt = quantize(Ft_p[b]), quantize(IFrame[b])
-
-                    # torchvision.utils.save_image(out, os.path.join(imgsave_folder, out_fname), normalize=True, range=(0,255))
+                    torchvision.utils.save_image(out, os.path.join(imgsave_folder, foldername, out_fname), normalize=True, range=(0,255))
                     # torchvision.utils.save_image(gt, os.path.join(imgsave_folder, gt_fname), normalize=True, range=(0,255))
 
                 psnr, ssim = eval_metrics(Ft_p, IFrame)
@@ -522,7 +523,7 @@ for epoch in range(dict1['epoch'] + 1, args.epochs):
         cross = torch.mean(compare_ftn(start, frame1) + compare_ftn(end, frame0), dim=(1,2,3))
 
         # I0 = torch.zeros_like(blurred_img)
-        IFrame = torch.zeros_like(I0)
+        IFrame = torch.zeros_like(blurred_img)
         choose_start = torch.zeros(batch_size).to(device)
 
         for b in range(batch_size):

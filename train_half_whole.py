@@ -79,28 +79,26 @@ validationFlowBackWarp = validationFlowBackWarp.to(device)
 center_estimation = center.Center()
 border_estimation = ends.Ends()
 
-if not args.extract11:
-    print('Estimation Network: best_gopro07.ckpt')
-    pretrained_weight = torch.load('pretrained_models/best_gopro07.ckpt')['state_dict']
-else:
-    print('Estimation Network: best_gopro11.ckpt')
-    pretrained_weight = torch.load('pretrained_models/best_gopro11.ckpt')['state_dict']
+if not (args.train_continue or args.test_only):
+    if not args.extract11:
+        print('Estimation Network: best_gopro07.ckpt')
+        pretrained_weight = torch.load('pretrained_models/best_gopro07.ckpt')['state_dict']
+    else:
+        print('Estimation Network: best_gopro11.ckpt')
+        pretrained_weight = torch.load('pretrained_models/best_gopro11.ckpt')['state_dict']
 
-center_state_dict = {}
-ends_state_dict = {}
-for key, value in pretrained_weight.items():
-    if key.startswith('center_est.'):
-        center_state_dict[key[11:]] = value
-    elif key.startswith('gen.'):
-        ends_state_dict[key[4:]] = value
+    center_state_dict = {}
+    ends_state_dict = {}
+    for key, value in pretrained_weight.items():
+        if key.startswith('center_est.'):
+            center_state_dict[key[11:]] = value
+        elif key.startswith('gen.'):
+            ends_state_dict[key[4:]] = value
 
-# print(center_state_dict.keys())
-
-center_estimation.load_state_dict(center_state_dict)
-border_estimation.load_state_dict(ends_state_dict)
-center_estimation = center_estimation.to(device)
-border_estimation = border_estimation.to(device)
-print('Estimation network')
+    center_estimation.load_state_dict(center_state_dict)
+    border_estimation.load_state_dict(ends_state_dict)
+    center_estimation = center_estimation.to(device)
+    border_estimation = border_estimation.to(device)
 
 ### Load Datasets
 # Channel wise mean calculated on adobe240-fps training dataset
@@ -455,17 +453,18 @@ def test():
                 Ft_p = meanshift(Ft_p, mean, std, device, False)
                 IFrame = meanshift(IFrame, mean, std, device, False)
 
-                # for b in range(batch_size):
-                #     foldername = os.path.basename(os.path.dirname(validationFile[ctr_idx][b]))
-                #     filename = os.path.splitext(os.path.basename(validationFile[vindex][b]))[0]
+                out = quantize(Ft_p[b])
+                foldername = os.path.basename(os.path.dirname(validationFile[ctr_idx][b]))
+                if not os.path.exists(os.path.join(imgsave_folder, foldername)):
+                    os.makedirs(os.path.join(imgsave_folder, foldername))
+                for b in range(batch_size):
+                    filename = os.path.splitext(os.path.basename(validationFile[vindex][b]))[0]
                     
-                #     out_fname = foldername + '_' + filename + '_out.png'
-                #     gt_fname = foldername + '_' + filename + '.png'
-
-                #     out, gt = quantize(Ft_p[b]), quantize(IFrame[b])
+                    out_fname = foldername + '_' + filename + '_out.png'
+                    # gt_fname = foldername + '_' + filename + '.png'
 
                     # Comment two lines below if you want to save images
-                    # torchvision.utils.save_image(out, os.path.join(imgsave_folder, out_fname), normalize=True, range=(0,255))
+                    torchvision.utils.save_image(out, os.path.join(imgsave_folder, foldername, out_fname), normalize=True, range=(0,255))
                     # torchvision.utils.save_image(gt, os.path.join(imgsave_folder, gt_fname), normalize=True, range=(0,255))
 
                 psnr, ssim = eval_metrics(Ft_p, IFrame)
@@ -485,7 +484,9 @@ if args.train_continue or args.test_only:
     dict1 = torch.load(args.checkpoint)
     ArbTimeFlowIntrp.load_state_dict(dict1['state_dictAT'])
     flowComp.load_state_dict(dict1['state_dictFC'])
-    print()
+    center_estimation.load_state_dict(dict1['state_dictCT'])
+    border_estimation.load_state_dict(dict1['state_dictBD'])
+    print('Load model from: ', args.checkpoint)
 else:
     dict1 = {'loss': [], 'valLoss': [], 'valPSNR': [], 'epoch': -1}
 
@@ -723,6 +724,8 @@ for epoch in range(dict1['epoch'] + 1, args.epochs):
                 'valPSNR':valPSNR,
                 'state_dictFC': flowComp.state_dict(),
                 'state_dictAT': ArbTimeFlowIntrp.state_dict(),
+                'state_dictCT': center_estimation.state_dict(),
+                'state_dictBD': border_estimation.state_dict(),
                 }
         torch.save(dict1, args.checkpoint_dir + "/SuperSloMo" + str(checkpoint_counter) + ".ckpt")
         checkpoint_counter += 1
