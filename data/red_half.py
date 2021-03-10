@@ -6,16 +6,14 @@ from os import path
 import random
 import tqdm
 
-from dataloader import _pil_loader
-
 import torch
 from torch import nn
 from torch.utils import data
 
 
-class GoPro(data.Dataset):
+class RedBase(data.Dataset):
     def __init__(self, root, transform=None, dim=(1280, 720), randomCropSize=(352, 352), seq_len=11, train=True):
-        super(GoPro, self).__init__()
+        super(RedBase, self).__init__()
         self.seq_len = seq_len
         self.randomCropSize = randomCropSize
         self.cropX0         = dim[0] - randomCropSize[0]
@@ -24,13 +22,11 @@ class GoPro(data.Dataset):
         self.transform      = transform
         self.train          = train
 
-        self._set_directory(root)
+        self.data_root = os.path.join(root, 'REDS120fps')
         self.data_dict = self._scan(train)
-        
-        self.n_samples = 0
-        self.n_sample_list = []
 
         self.img_type = 'bin'
+        # Pre-decode png files
         if self.img_type == 'bin':
             for k in tqdm.tqdm(self.data_dict.keys(), ncols=80):
                 bin_path = os.path.join(self.data_root, 'bin')
@@ -49,12 +45,14 @@ class GoPro(data.Dataset):
                         np.save(save_as, img)
                     # Update the dictionary
                     self.data_dict[k][idx] = save_as + '.npy'
-
+        
+        self.n_samples = 0
+        self.n_sample_list = []
         # when testing, we do not overlap the video sequence (0~6, 7~13, ...)
         if train:
             for k in self.data_dict.keys():
                 self.n_sample_list.append(self.n_samples)
-                self.n_samples += len(self.data_dict[k]) - (self.seq_len - 1)
+                self.n_samples += len(self.data_dict[k]) // self.seq_len
             self.n_sample_list.append(self.n_samples)
         else:
             for k in self.data_dict.keys():
@@ -63,9 +61,6 @@ class GoPro(data.Dataset):
             self.n_sample_list.append(self.n_samples)
             
         print("Sample #:", self.n_sample_list)
-
-    def _set_directory(self, data_root):
-        self.data_root = path.join(data_root, 'GoPro')
 
     def _scan(self, train):
         def _make_keys(dir_path):
@@ -77,8 +72,9 @@ class GoPro(data.Dataset):
             tv = 'train' if dir.find('train')>=0 else 'test'
             return tv + '_' + base
 
+
         if train:
-            dir_train = path.join(self.data_root, 'train')
+            dir_train = path.join(self.data_root, 'train/train_orig')
             list_seq = glob.glob(dir_train+'/*')
             data_dict = {
                 _make_keys(k): sorted(
@@ -87,7 +83,7 @@ class GoPro(data.Dataset):
             }
 
         else:
-            dir_test = path.join(self.data_root, 'test')
+            dir_test = path.join(self.data_root, 'val/val_orig')
             list_seq = glob.glob(dir_test+'/*')
             data_dict = {
                 _make_keys(k): sorted(
@@ -105,17 +101,28 @@ class GoPro(data.Dataset):
         raise ValueError()
 
     def __getitem__(self, idx):
-        if self.train:
-            half = idx % 2
-            idx = idx // 2
-            key, index = self._find_key(idx)
-        else:
-            key, index = self._find_key(idx)
+        key, index = self._find_key(idx)
+        index *= self.seq_len
+
         if self.train:
             filepath_list = [self.data_dict[key][i] for i in range(index, index+self.seq_len)]
+            blurfile_dir = os.path.dirname(filepath_list[0]).replace('train_orig', 'train_blur').replace('REDS120fps', 'REDS')
+            if self.img_type == 'img':
+                blurfile_file = '{:08d}.png'.format(index // 5)
+            else:
+                blurfile_file = '{:08d}.npy'.format(index // 5)
+            blurfile = os.path.join(blurfile_dir, blurfile_file)
+            filepath_list.append(blurfile)
         else:
-            index *= self.seq_len
             filepath_list = [self.data_dict[key][i] for i in range(index, index+self.seq_len)]
+            blurfile_dir = os.path.dirname(filepath_list[0]).replace('val_orig', 'val_blur').replace('REDS120fps', 'REDS')
+            if self.img_type == 'img':
+                blurfile_file = '{:08d}.png'.format(index // 5)
+            else:
+                blurfile_file = '{:08d}.npy'.format(index // 5)
+            blurfile = os.path.join(blurfile_dir, blurfile_file)
+            filepath_list.append(blurfile)
+
         if self.train:
             r = random.random()
             if r > 0.5:
@@ -158,16 +165,16 @@ class GoPro(data.Dataset):
                 IFrameIndex = IFrameIndex - 1
             returnIndex = IFrameIndex - 1
             # frameRange = [0, IFrameIndex, 10]
-            frameRange = [i for i in range(self.seq_len)]
+            frameRange = [i for i in range(self.seq_len + 1)]  # +1 for blurry image
             randomFrameFlip = 0
-        
+
         if self.img_type == 'img':
             fn_read = imageio.imread
         elif self.img_type == 'bin':
             fn_read = np.load
         else:
             raise ValueError('Wrong img type: {}'.format(self.img_type))
-
+               
         # Loop over for all frames corresponding to the `index`.
         for frameIndex in frameRange:
             # Open image using pil and augment the image.

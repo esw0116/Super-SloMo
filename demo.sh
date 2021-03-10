@@ -1,0 +1,7 @@
+python train_half_whole.py --dataset gopro --add_blur --test_only --extract ./pretrained_models/0303_220548.ckpt --checkpoint ./checkpoint/JointGoPro11_0303220548/SuperSloMo5.ckpt --checkpoint_dir ./checkpoint/Paper_GoPro07/ --seq_len 7 --save_img
+python train_half_whole.py --dataset gopro --add_blur --test_only --extract ./pretrained_models/0303_220548.ckpt --checkpoint ./checkpoint/JointGoPro11_0303220548/SuperSloMo5.ckpt --checkpoint_dir ./checkpoint/Paper_GoPro11/ --seq_len 11 --save_img
+python train_half_whole.py --dataset gopro --add_blur --test_only --extract ./pretrained_models/0303_220548.ckpt --checkpoint ./checkpoint/JointGoPro11_0303220548/SuperSloMo5.ckpt --checkpoint_dir ./checkpoint/Paper_GoPro13/ --seq_len 13 --save_img
+
+
+python train_half_whole.py --dataset reds --add_blur --test_only --extract ./pretrained_models/0303_220548.ckpt --checkpoint ./checkpoint/JointGoPro11_0303220548/SuperSloMo5.ckpt --checkpoint_dir ./checkpoint/Paper_REDS05/ --seq_len 5 --save_img
+python train_half_whole.py --dataset reds --add_blur --test_only --extract ./pretrained_models/0303_220548.ckpt --checkpoint ./checkpoint/JointGoPro11_0303220548/SuperSloMo5.ckpt --checkpoint_dir ./checkpoint/Paper_REDS07/ --seq_len 7

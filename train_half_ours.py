@@ -147,7 +147,8 @@ params = list(ArbTimeFlowIntrp.parameters()) + list(flowComp.parameters())
 optimizer = optim.Adam(params, lr=args.init_learning_rate)
 
 # scheduler to decrease learning rate by a factor of 10 at milestones.
-scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.milestones, gamma=0.1)
+# scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.milestones, gamma=0.1)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', factor=0.1, patience=3, verbose=True)
 
 ###Initializing VGG16 model for perceptual loss
 
@@ -463,6 +464,7 @@ def test():
 ### Initialization
 if args.train_continue or args.test_only:
     dict1 = torch.load(args.checkpoint)
+    checkpoint_counter = dict1['epoch'] + 1
     ArbTimeFlowIntrp.load_state_dict(dict1['state_dictAT'])
     flowComp.load_state_dict(dict1['state_dictFC'])
     print()
@@ -689,7 +691,7 @@ for epoch in range(dict1['epoch'] + 1, args.epochs):
     print("Loss: %0.6f TrainExecTime: %0.1f  ValLoss:%0.6f  ValPSNR: %0.4f  ValEvalTime: %0.2f LR: %f" % (iLoss / len(trainloader),  endtime - starttime, vLoss, psnr, endVal - endtime, get_lr(optimizer)))
         
     # Increment scheduler count    
-    scheduler.step()
+    scheduler.step(psnr)
     
     # Create checkpoint after every `args.checkpoint_epoch` epochs
     if ((epoch % args.checkpoint_epoch) == args.checkpoint_epoch - 1):

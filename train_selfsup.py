@@ -35,17 +35,16 @@ parser.add_argument("--checkpoint_dir", type=str, required=True, help='path to f
 parser.add_argument("--checkpoint", type=str, help='path of checkpoint for pretrained model')
 parser.add_argument("--train_continue", action='store_true', help='If resuming from checkpoint, set to True and set `checkpoint` path. Default: False.')
 parser.add_argument("--test_only", action='store_true', help='If resuming from checkpoint, set to True and set `checkpoint` path. Default: False.')
-parser.add_argument("--add_blur", action='store_true', help='Add blurry image')
 parser.add_argument("--extract", type=str, required=True, help='Add blurry image')
 parser.add_argument("--epochs", type=int, default=40, help='number of epochs to train. Default: 200.')
 parser.add_argument("--seq_len", type=int, default=11, help='number of frames that composes a sequence.')
+parser.add_argument("--patch_size", type=int, default=352, help='patch size when training.')
 parser.add_argument("--train_batch_size", type=int, default=8, help='batch size for training. Default: 6.')
 parser.add_argument("--validation_batch_size", type=int, default=1, help='batch size for validation. Default: 10.')
 parser.add_argument("--init_learning_rate", type=float, default=0.0001, help='set initial learning rate. Default: 0.0001.')
 parser.add_argument("--milestones", type=list, default=[20, 30], help='Set to epoch values where you want to decrease learning rate by a factor of 0.1. Default: [100, 150]')
 parser.add_argument("--progress_iter", type=int, default=1000, help='frequency of reporting progress and validation. N: after every N iterations. Default: 100.')
 parser.add_argument("--checkpoint_epoch", type=int, default=1, help='checkpoint saving frequency. N: after every N epochs. Each checkpoint is roughly of size 151 MB.Default: 5.')
-parser.add_argument("--amp", action='store_true', help='If True, use mixed precision.')
 parser.add_argument('--save_img', action='store_true', help='save images')
 
 args = parser.parse_args()
@@ -56,23 +55,17 @@ writer = SummaryWriter('log')
 if not os.path.exists(args.checkpoint_dir):
     os.makedirs(args.checkpoint_dir)
 
-scaler = torch.cuda.amp.GradScaler()
-
 ###Initialize flow computation and arbitrary-time flow interpolation CNNs.
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 flowComp = superslomo.UNet(6, 4)
 flowComp.to(device)
-if args.add_blur:
-    ArbTimeFlowIntrp = superslomo.UNet(23, 5)
-else:
-    ArbTimeFlowIntrp = superslomo.UNet(20, 5)
+ArbTimeFlowIntrp = superslomo.UNet(20, 5)
 ArbTimeFlowIntrp.to(device)
 
 
 ###Initialze backward warpers for train and validation datasets
-
-trainFlowBackWarp      = superslomo.backWarp(352, 352, device)
+trainFlowBackWarp      = superslomo.backWarp(args.patch_size, args.patch_size, device)
 trainFlowBackWarp      = trainFlowBackWarp.to(device)
 if not args.test_only:
     validationFlowBackWarp = superslomo.backWarp(1248, 672, device)
@@ -112,7 +105,7 @@ normalize = transforms.Normalize(mean=mean, std=std)
 transform = transforms.Compose([transforms.ToTensor(), normalize])
 
 # GoPro
-trainset = gopro_blur.GoPro(root=args.dataset_root, transform=transform, seq_len=args.seq_len, train=True)
+trainset = gopro_blur.GoPro(root=args.dataset_root, transform=transform, randomCropSize=(args.patch_size, args.patch_size), seq_len=args.seq_len, train=True)
 trainloader = torch.utils.data.DataLoader(trainset, batch_size=args.train_batch_size, shuffle=True)
 
 if args.dataset == 'gopro':
@@ -189,6 +182,46 @@ for param in vgg16_conv_4_3.parameters():
 
 compare_ftn = nn.L1Loss(reduction='none')
 
+
+## Super Slomo Function
+def Slomo(I0, I1, index, device, seq_len):
+    flowOut = flowComp(torch.cat((I0, I1), dim=1))
+    
+    # Extracting flows between I0 and I1 - F_0_1 and F_1_0
+    F_0_1 = flowOut[:,:2,:,:]
+    F_1_0 = flowOut[:,2:,:,:]
+    
+    fCoeff = superslomo.getFlowCoeff(index, device, seq_len)
+    
+    # Calculate intermediate flows
+    F_t_0 = fCoeff[0] * F_0_1 + fCoeff[1] * F_1_0
+    F_t_1 = fCoeff[2] * F_0_1 + fCoeff[3] * F_1_0
+    
+    # Get intermediate frames from the intermediate flows
+    g_I0_F_t_0 = trainFlowBackWarp(I0, F_t_0)
+    g_I1_F_t_1 = trainFlowBackWarp(I1, F_t_1)
+    
+    # Calculate optical flow residuals and visibility maps
+    intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
+    
+    # Extract optical flow residuals and visibility maps
+    F_t_0_f = intrpOut[:, :2, :, :] + F_t_0
+    F_t_1_f = intrpOut[:, 2:4, :, :] + F_t_1
+    V_t_0   = torch.sigmoid(intrpOut[:, 4:5, :, :])
+    V_t_1   = 1 - V_t_0
+    
+    # Get intermediate frames from the intermediate flows
+    g_I0_F_t_0_f = trainFlowBackWarp(I0, F_t_0_f)
+    g_I1_F_t_1_f = trainFlowBackWarp(I1, F_t_1_f)
+    
+    wCoeff = superslomo.getWarpCoeff(index, device, seq_len)
+    
+    # Calculate final intermediate frame 
+    Ft_p = (wCoeff[0] * V_t_0 * g_I0_F_t_0_f + wCoeff[1] * V_t_1 * g_I1_F_t_1_f) / (wCoeff[0] * V_t_0 + wCoeff[1] * V_t_1)
+
+    return Ft_p, g_I0_F_t_0, g_I1_F_t_1, F_1_0, F_0_1
+
+
 ### Validation function
 
 def validate():
@@ -242,92 +275,44 @@ def validate():
                 if validationFrameIndex[b] > (ctr_idx - 1):
                     validationFrameIndex[b] = seq_len - 3 - validationFrameIndex[b]
             
-            if args.amp:
-                with torch.cuda.amp.autocast():
-                    flowOut = flowComp(torch.cat((I0, I1), dim=1))
-                    F_0_1 = flowOut[:,:2,:,:]
-                    F_1_0 = flowOut[:,2:,:,:]
+            flowOut = flowComp(torch.cat((I0, I1), dim=1))
+            F_0_1 = flowOut[:,:2,:,:]
+            F_1_0 = flowOut[:,2:,:,:]
 
-                    fCoeff = superslomo.getFlowCoeff(validationFrameIndex, device, seq_len)
-
-                    F_t_0 = fCoeff[0] * F_0_1 + fCoeff[1] * F_1_0
-                    F_t_1 = fCoeff[2] * F_0_1 + fCoeff[3] * F_1_0
-                    
-                    g_I0_F_t_0 = validationFlowBackWarp(I0, F_t_0)
-                    g_I1_F_t_1 = validationFlowBackWarp(I1, F_t_1)
-                    
-                    if args.add_blur:
-                        intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0, blurred_img), dim=1))
-                    else:
-                        intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
-                    
-                    F_t_0_f = intrpOut[:, :2, :, :] + F_t_0
-                    F_t_1_f = intrpOut[:, 2:4, :, :] + F_t_1
-                    V_t_0   = torch.sigmoid(intrpOut[:, 4:5, :, :])
-                    V_t_1   = 1 - V_t_0
-                    
-                    g_I0_F_t_0_f = validationFlowBackWarp(I0, F_t_0_f)
-                    g_I1_F_t_1_f = validationFlowBackWarp(I1, F_t_1_f)
-                    
-                    wCoeff = superslomo.getWarpCoeff(validationFrameIndex, device, seq_len)
-                    
-                    Ft_p = (wCoeff[0] * V_t_0 * g_I0_F_t_0_f + wCoeff[1] * V_t_1 * g_I1_F_t_1_f) / (wCoeff[0] * V_t_0 + wCoeff[1] * V_t_1)
-                    
-                    #loss
-                    # recnLoss = L1_lossFn(Ft_p, IFrame)
-                    
-                    # prcpLoss = MSE_LossFn(vgg16_conv_4_3(Ft_p), vgg16_conv_4_3(IFrame))
-                    
-                    # warpLoss = L1_lossFn(g_I0_F_t_0, IFrame) + L1_lossFn(g_I1_F_t_1, IFrame) + L1_lossFn(validationFlowBackWarp(I0, F_1_0), I1) + L1_lossFn(validationFlowBackWarp(I1, F_0_1), I0)
-                
-                    # loss_smooth_1_0 = torch.mean(torch.abs(F_1_0[:, :, :, :-1] - F_1_0[:, :, :, 1:])) + torch.mean(torch.abs(F_1_0[:, :, :-1, :] - F_1_0[:, :, 1:, :]))
-                    # loss_smooth_0_1 = torch.mean(torch.abs(F_0_1[:, :, :, :-1] - F_0_1[:, :, :, 1:])) + torch.mean(torch.abs(F_0_1[:, :, :-1, :] - F_0_1[:, :, 1:, :]))
-                    # loss_smooth = loss_smooth_1_0 + loss_smooth_0_1
-                    
-                    # loss = 204 * recnLoss + 102 * warpLoss + 0.005 * prcpLoss + loss_smooth
-
-            else:
-                flowOut = flowComp(torch.cat((I0, I1), dim=1))
-                F_0_1 = flowOut[:,:2,:,:]
-                F_1_0 = flowOut[:,2:,:,:]
-
-                fCoeff = superslomo.getFlowCoeff(validationFrameIndex, device, seq_len)
-                
-                F_t_0 = fCoeff[0] * F_0_1 + fCoeff[1] * F_1_0
-                F_t_1 = fCoeff[2] * F_0_1 + fCoeff[3] * F_1_0
-
-                g_I0_F_t_0 = validationFlowBackWarp(I0, F_t_0)
-                g_I1_F_t_1 = validationFlowBackWarp(I1, F_t_1)
-                
-                if args.add_blur:
-                    intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0, blurred_img), dim=1))
-                else:
-                    intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
-                
-                F_t_0_f = intrpOut[:, :2, :, :] + F_t_0
-                F_t_1_f = intrpOut[:, 2:4, :, :] + F_t_1
-                V_t_0   = torch.sigmoid(intrpOut[:, 4:5, :, :])
-                V_t_1   = 1 - V_t_0
-                
-                g_I0_F_t_0_f = validationFlowBackWarp(I0, F_t_0_f)
-                g_I1_F_t_1_f = validationFlowBackWarp(I1, F_t_1_f)
-                
-                wCoeff = superslomo.getWarpCoeff(validationFrameIndex, device, seq_len)
-                
-                Ft_p = (wCoeff[0] * V_t_0 * g_I0_F_t_0_f + wCoeff[1] * V_t_1 * g_I1_F_t_1_f) / (wCoeff[0] * V_t_0 + wCoeff[1] * V_t_1)
-                
-                #loss
-                # recnLoss = L1_lossFn(Ft_p, IFrame)
-                
-                # prcpLoss = MSE_LossFn(vgg16_conv_4_3(Ft_p), vgg16_conv_4_3(IFrame))
-                
-                # warpLoss = L1_lossFn(g_I0_F_t_0, IFrame) + L1_lossFn(g_I1_F_t_1, IFrame) + L1_lossFn(validationFlowBackWarp(I0, F_1_0), I1) + L1_lossFn(validationFlowBackWarp(I1, F_0_1), I0)
+            fCoeff = superslomo.getFlowCoeff(validationFrameIndex, device, seq_len)
             
-                # loss_smooth_1_0 = torch.mean(torch.abs(F_1_0[:, :, :, :-1] - F_1_0[:, :, :, 1:])) + torch.mean(torch.abs(F_1_0[:, :, :-1, :] - F_1_0[:, :, 1:, :]))
-                # loss_smooth_0_1 = torch.mean(torch.abs(F_0_1[:, :, :, :-1] - F_0_1[:, :, :, 1:])) + torch.mean(torch.abs(F_0_1[:, :, :-1, :] - F_0_1[:, :, 1:, :]))
-                # loss_smooth = loss_smooth_1_0 + loss_smooth_0_1
-                
-                # loss = 204 * recnLoss + 102 * warpLoss + 0.005 * prcpLoss + loss_smooth
+            F_t_0 = fCoeff[0] * F_0_1 + fCoeff[1] * F_1_0
+            F_t_1 = fCoeff[2] * F_0_1 + fCoeff[3] * F_1_0
+
+            g_I0_F_t_0 = validationFlowBackWarp(I0, F_t_0)
+            g_I1_F_t_1 = validationFlowBackWarp(I1, F_t_1)
+            
+            intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
+            
+            F_t_0_f = intrpOut[:, :2, :, :] + F_t_0
+            F_t_1_f = intrpOut[:, 2:4, :, :] + F_t_1
+            V_t_0   = torch.sigmoid(intrpOut[:, 4:5, :, :])
+            V_t_1   = 1 - V_t_0
+            
+            g_I0_F_t_0_f = validationFlowBackWarp(I0, F_t_0_f)
+            g_I1_F_t_1_f = validationFlowBackWarp(I1, F_t_1_f)
+            
+            wCoeff = superslomo.getWarpCoeff(validationFrameIndex, device, seq_len)
+            
+            Ft_p = (wCoeff[0] * V_t_0 * g_I0_F_t_0_f + wCoeff[1] * V_t_1 * g_I1_F_t_1_f) / (wCoeff[0] * V_t_0 + wCoeff[1] * V_t_1)
+            
+            #loss
+            # recnLoss = L1_lossFn(Ft_p, IFrame)
+            
+            # prcpLoss = MSE_LossFn(vgg16_conv_4_3(Ft_p), vgg16_conv_4_3(IFrame))
+            
+            # warpLoss = L1_lossFn(g_I0_F_t_0, IFrame) + L1_lossFn(g_I1_F_t_1, IFrame) + L1_lossFn(validationFlowBackWarp(I0, F_1_0), I1) + L1_lossFn(validationFlowBackWarp(I1, F_0_1), I0)
+        
+            # loss_smooth_1_0 = torch.mean(torch.abs(F_1_0[:, :, :, :-1] - F_1_0[:, :, :, 1:])) + torch.mean(torch.abs(F_1_0[:, :, :-1, :] - F_1_0[:, :, 1:, :]))
+            # loss_smooth_0_1 = torch.mean(torch.abs(F_0_1[:, :, :, :-1] - F_0_1[:, :, :, 1:])) + torch.mean(torch.abs(F_0_1[:, :, :-1, :] - F_0_1[:, :, 1:, :]))
+            # loss_smooth = loss_smooth_1_0 + loss_smooth_0_1
+            
+            # loss = 204 * recnLoss + 102 * warpLoss + 0.005 * prcpLoss + loss_smooth
 
             tloss += 0 #loss.item()
             
@@ -455,10 +440,7 @@ def test():
                     g_I0_F_t_0 = validationFlowBackWarp(I0, F_t_0)
                     g_I1_F_t_1 = validationFlowBackWarp(I1, F_t_1)
                     
-                    if args.add_blur:
-                        intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0, blurred_img), dim=1))
-                    else:
-                        intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
+                    intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
                     
                     F_t_0_f = intrpOut[:, :2, :, :] + F_t_0
                     F_t_1_f = intrpOut[:, 2:4, :, :] + F_t_1
@@ -531,6 +513,7 @@ valLoss = dict1['valLoss']
 valPSNR = dict1['valPSNR']
 if not args.train_continue:
     checkpoint_counter = 0
+psnr, vLoss, valImg = validate()
 
 ### Main training loop
 for epoch in range(dict1['epoch'] + 1, args.epochs):
@@ -571,142 +554,55 @@ for epoch in range(dict1['epoch'] + 1, args.epochs):
         parallel = torch.mean(compare_ftn(start, frame0) + compare_ftn(end, frame1), dim=(1,2,3))
         cross = torch.mean(compare_ftn(start, frame1) + compare_ftn(end, frame0), dim=(1,2,3))
 
+        for b in range(batch_size):
+            if parallel[b] > cross[b]:
+                start[b], end[b] = end[b], start[b]
+
         I0 = torch.zeros_like(blurred_img)
         I1 = center
-        IFrame = torch.zeros_like(I0)
+        Ft_p = frame0 + frame1
 
-        for b in range(batch_size):
-            if (trainFrameIndex[b] < (ctr_idx - 1) and parallel[b] <= cross[b]) or (trainFrameIndex[b] > (ctr_idx - 1) and parallel[b] > cross[b]):
-                I0[b] = start[b]
+        EdgeLoss = Minorder_LossFn([start, end], [frame0, frame1])
+        fullwarploss = 0
+        loss_smooth = 0
+        loss = 102 * EdgeLoss
+
+        for idx in range(seq_len - 2):
+            if idx == ctr_idx - 1:
+                Ft_p = Ft_p + center
+
             else:
-                I0[b] = end[b]
-
-            IFrame[b] = trainData[trainFrameIndex[b]+1][b]
-
-            if trainFrameIndex[b] > (ctr_idx - 1):
-                trainFrameIndex[b] = seq_len - 3 - trainFrameIndex[b]
-
-        if args.amp:
-            with torch.cuda.amp.autocast():
-                EdgeLoss = Minorder_LossFn([start, end], [frame0, frame1])
-
-                # Calculate flow between reference frames I0 and I1
-                flowOut = flowComp(torch.cat((I0, I1), dim=1))
-                
-                # Extracting flows between I0 and I1 - F_0_1 and F_1_0
-                F_0_1 = flowOut[:,:2,:,:]
-                F_1_0 = flowOut[:,2:,:,:]
-                
-                fCoeff = superslomo.getFlowCoeff(trainFrameIndex, device, seq_len)
-                
-                # Calculate intermediate flows
-                F_t_0 = fCoeff[0] * F_0_1 + fCoeff[1] * F_1_0
-                F_t_1 = fCoeff[2] * F_0_1 + fCoeff[3] * F_1_0
-                
-                # Get intermediate frames from the intermediate flows
-                g_I0_F_t_0 = trainFlowBackWarp(I0, F_t_0)
-                g_I1_F_t_1 = trainFlowBackWarp(I1, F_t_1)
-                
-                # Calculate optical flow residuals and visibility maps
-                if args.add_blur:
-                    intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0, blurred_img), dim=1))
+                if idx < (ctr_idx - 1):
+                    I0 = start
+                    my_idx = torch.Tensor([idx] * batch_size).long()
                 else:
-                    intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
+                    I0 = end
+                    my_idx = torch.Tensor([seq_len - 3 - idx] * batch_size).long()
 
-                # Extract optical flow residuals and visibility maps
-                F_t_0_f = intrpOut[:, :2, :, :] + F_t_0
-                F_t_1_f = intrpOut[:, 2:4, :, :] + F_t_1
-                V_t_0   = torch.sigmoid(intrpOut[:, 4:5, :, :])
-                V_t_1   = 1 - V_t_0
-                
-                # Get intermediate frames from the intermediate flows
-                g_I0_F_t_0_f = trainFlowBackWarp(I0, F_t_0_f)
-                g_I1_F_t_1_f = trainFlowBackWarp(I1, F_t_1_f)
-                
-                wCoeff = superslomo.getWarpCoeff(trainFrameIndex, device, seq_len)
-                
-                # Calculate final intermediate frame 
-                Ft_p = (wCoeff[0] * V_t_0 * g_I0_F_t_0_f + wCoeff[1] * V_t_1 * g_I1_F_t_1_f) / (wCoeff[0] * V_t_0 + wCoeff[1] * V_t_1)
-                
+                ft_p, g_I0_F_t_0, g_I1_F_t_1, F_1_0, F_0_1 = Slomo(I0, I1, my_idx, device, seq_len)
+                Ft_p = Ft_p + ft_p
+
                 # Loss
-                recnLoss = L1_lossFn(Ft_p, IFrame)
-                    
-                prcpLoss = MSE_LossFn(vgg16_conv_4_3(Ft_p), vgg16_conv_4_3(IFrame))
-                
-                warpLoss = L1_lossFn(g_I0_F_t_0, IFrame) + L1_lossFn(g_I1_F_t_1, IFrame) + L1_lossFn(trainFlowBackWarp(I0, F_1_0), I1) + L1_lossFn(trainFlowBackWarp(I1, F_0_1), I0)
-                
-                loss_smooth_1_0 = torch.mean(torch.abs(F_1_0[:, :, :, :-1] - F_1_0[:, :, :, 1:])) + torch.mean(torch.abs(F_1_0[:, :, :-1, :] - F_1_0[:, :, 1:, :]))
-                loss_smooth_0_1 = torch.mean(torch.abs(F_0_1[:, :, :, :-1] - F_0_1[:, :, :, 1:])) + torch.mean(torch.abs(F_0_1[:, :, :-1, :] - F_0_1[:, :, 1:, :]))
-                loss_smooth = loss_smooth_1_0 + loss_smooth_0_1
-                
-                # Total Loss - Coefficients 204 and 102 are used instead of 0.8 and 0.4
-                # since the loss in paper is calculated for input pixels in range 0-255
-                # and the input to our network is in range 0-1
-                loss = 102 * EdgeLoss + 204 * recnLoss + 102 * warpLoss + 0.005 * prcpLoss + loss_smooth
+                if idx == 0 or idx == seq_len - 3:
+                    fullwarploss +=  L1_lossFn(trainFlowBackWarp(I0, F_1_0), I1) + L1_lossFn(trainFlowBackWarp(I1, F_0_1), I0)
+                    loss_smooth_1_0 = torch.mean(torch.abs(F_1_0[:, :, :, :-1] - F_1_0[:, :, :, 1:])) + torch.mean(torch.abs(F_1_0[:, :, :-1, :] - F_1_0[:, :, 1:, :]))
+                    loss_smooth_0_1 = torch.mean(torch.abs(F_0_1[:, :, :, :-1] - F_0_1[:, :, :, 1:])) + torch.mean(torch.abs(F_0_1[:, :, :-1, :] - F_0_1[:, :, 1:, :]))
+                    loss_smooth += loss_smooth_1_0 + loss_smooth_0_1
+
+                warpLoss = 0.25 * (L1_lossFn(g_I0_F_t_0, g_I1_F_t_1.detach()) + L1_lossFn(g_I1_F_t_1, g_I0_F_t_0))
+                loss = loss + (102 * warpLoss) / (seq_len - 3)
+
         
-            # Backpropagate
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+        Ft_p = Ft_p / seq_len
 
-        else:
-            EdgeLoss = Minorder_LossFn([start, end], [frame0, frame1])
+        recnLoss = L1_lossFn(Ft_p, blurred_img)
+        prcpLoss = MSE_LossFn(vgg16_conv_4_3(Ft_p), vgg16_conv_4_3(blurred_img))
 
-            # Calculate flow between reference frames I0 and I1
-            flowOut = flowComp(torch.cat((I0, I1), dim=1))
-            
-            # Extracting flows between I0 and I1 - F_0_1 and F_1_0
-            F_0_1 = flowOut[:,:2,:,:]
-            F_1_0 = flowOut[:,2:,:,:]
-            
-            fCoeff = superslomo.getFlowCoeff(trainFrameIndex, device, seq_len)
-            
-            # Calculate intermediate flows
-            F_t_0 = fCoeff[0] * F_0_1 + fCoeff[1] * F_1_0
-            F_t_1 = fCoeff[2] * F_0_1 + fCoeff[3] * F_1_0
-            
-            # Get intermediate frames from the intermediate flows
-            g_I0_F_t_0 = trainFlowBackWarp(I0, F_t_0)
-            g_I1_F_t_1 = trainFlowBackWarp(I1, F_t_1)
-            
-            # Calculate optical flow residuals and visibility maps
-            if args.add_blur:
-                intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0, blurred_img), dim=1))
-            else:
-                intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
-            
-            # Extract optical flow residuals and visibility maps
-            F_t_0_f = intrpOut[:, :2, :, :] + F_t_0
-            F_t_1_f = intrpOut[:, 2:4, :, :] + F_t_1
-            V_t_0   = torch.sigmoid(intrpOut[:, 4:5, :, :])
-            V_t_1   = 1 - V_t_0
-            
-            # Get intermediate frames from the intermediate flows
-            g_I0_F_t_0_f = trainFlowBackWarp(I0, F_t_0_f)
-            g_I1_F_t_1_f = trainFlowBackWarp(I1, F_t_1_f)
-            
-            wCoeff = superslomo.getWarpCoeff(trainFrameIndex, device, seq_len)
-            
-            # Calculate final intermediate frame 
-            Ft_p = (wCoeff[0] * V_t_0 * g_I0_F_t_0_f + wCoeff[1] * V_t_1 * g_I1_F_t_1_f) / (wCoeff[0] * V_t_0 + wCoeff[1] * V_t_1)
-            
-            # Loss
-            recnLoss = L1_lossFn(Ft_p, IFrame)
-            prcpLoss = MSE_LossFn(vgg16_conv_4_3(Ft_p), vgg16_conv_4_3(IFrame))
-            warpLoss = L1_lossFn(g_I0_F_t_0, IFrame) + L1_lossFn(g_I1_F_t_1, IFrame) + L1_lossFn(trainFlowBackWarp(I0, F_1_0), I1) + L1_lossFn(trainFlowBackWarp(I1, F_0_1), I0)
-            
-            loss_smooth_1_0 = torch.mean(torch.abs(F_1_0[:, :, :, :-1] - F_1_0[:, :, :, 1:])) + torch.mean(torch.abs(F_1_0[:, :, :-1, :] - F_1_0[:, :, 1:, :]))
-            loss_smooth_0_1 = torch.mean(torch.abs(F_0_1[:, :, :, :-1] - F_0_1[:, :, :, 1:])) + torch.mean(torch.abs(F_0_1[:, :, :-1, :] - F_0_1[:, :, 1:, :]))
-            loss_smooth = loss_smooth_1_0 + loss_smooth_0_1
-            
-            # Total Loss - Coefficients 204 and 102 are used instead of 0.8 and 0.4
-            # since the loss in paper is calculated for input pixels in range 0-255
-            # and the input to our network is in range 0-1
-            loss = 102 * EdgeLoss + 204 * recnLoss + 102 * warpLoss + 0.005 * prcpLoss + loss_smooth
-    
-            # Backpropagate
-            loss.backward()
-            optimizer.step()
+        loss = loss + 204 * recnLoss + 102 * fullwarploss
+
+        # Backpropagate
+        loss.backward()
+        optimizer.step()
 
         iLoss += loss.item()
         # print(loss.item())
